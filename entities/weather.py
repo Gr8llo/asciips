@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from config import (
+    CLOUD_CONDITIONS,
     COLOR_CLOUD,
     COLOR_CLOUD_DAY,
     COLOR_DARK_CLOUD,
@@ -21,6 +22,10 @@ from config import (
     COLOR_STAR_BRIGHT,
     COLOR_STAR_DIM,
     COLOR_SUN,
+    PRECIPITATION_CONDITIONS,
+    RAIN_CONDITIONS,
+    SNOW_CONDITIONS,
+    THUNDERSTORM_CONDITIONS,
     NIGHT_SKY_GRADIENT,
     RGB,
     SKY_GRADIENTS,
@@ -299,7 +304,10 @@ class WeatherSystem:
     def _init_seagulls(self) -> None:
         """Popola il cielo con 3 gabbiani iniziali solo se il meteo è CLEAR o CLOUDY."""
         self.seagulls.clear()
-        if self.condition not in (WeatherCondition.CLEAR, WeatherCondition.CLOUDY):
+        if self.condition not in (
+            WeatherCondition.CLEAR,
+            WeatherCondition.PARTLY_CLOUDY,
+        ):
             return
         initial_count = 3
         for idx in range(initial_count):
@@ -323,39 +331,76 @@ class WeatherSystem:
 
     def _spawn_particles(self, sea_level_y: int) -> None:
         """Mantiene il numero ottimale di particelle per pioggia, neve o temporale."""
-        if self.condition in (WeatherCondition.CLEAR, WeatherCondition.CLOUDY):
+        if (
+            self.condition not in PRECIPITATION_CONDITIONS
+            and self.condition != WeatherCondition.FOG
+        ):
             self.particles.clear()
             return
 
-        target_count = (
-            max(40, (self.width * sea_level_y) // 18)
-            if self.condition == WeatherCondition.STORM
-            else max(25, (self.width * sea_level_y) // 28)
-        )
+        if self.condition == WeatherCondition.FOG:
+            target_count = max(12, self.width // 2)
+        elif self.condition in THUNDERSTORM_CONDITIONS:
+            target_count = max(40, (self.width * sea_level_y) // 18)
+        elif self.condition == WeatherCondition.DRIZZLE:
+            target_count = max(18, (self.width * sea_level_y) // 42)
+        else:
+            target_count = max(25, (self.width * sea_level_y) // 28)
 
         while len(self.particles) < target_count:
             x = random.uniform(-10.0, float(self.width + 5))
             y = random.uniform(1.0, float(max(2, sea_level_y)))
-            if self.condition == WeatherCondition.SNOW:
+            if self.condition in SNOW_CONDITIONS:
                 self.particles.append(
                     WeatherParticle(
                         x=x,
                         y=y,
-                        vx=random.uniform(-1.1, 1.1),
-                        vy=random.uniform(2.3, 4.4),
-                        char=random.choice(["*", ".", "+"]),
+                        vx=random.uniform(-0.7, 0.7),
+                        vy=(
+                            random.uniform(2.3, 4.4)
+                            if self.condition == WeatherCondition.SNOW
+                            else random.uniform(1.2, 2.2)
+                        ),
+                        char=(
+                            random.choice(["*", ".", "+"])
+                            if self.condition == WeatherCondition.SNOW
+                            else random.choice([".", "·", ","])
+                        ),
                         phase=random.uniform(0.0, math.tau),
                     )
                 )
+            elif self.condition == WeatherCondition.FOG:
+                self.particles.append(
+                    WeatherParticle(
+                        x=x,
+                        y=y,
+                        vx=random.uniform(-0.25, 0.25),
+                        vy=random.uniform(-0.08, 0.08),
+                        char=random.choice(["░", "▒", "·"]),
+                    )
+                )
             else:
-                speed_mult = 1.35 if self.condition == WeatherCondition.STORM else 1.0
+                is_thunderstorm = self.condition in THUNDERSTORM_CONDITIONS
+                speed_mult = 1.35 if is_thunderstorm else (
+                    0.55 if self.condition == WeatherCondition.DRIZZLE else 1.0
+                )
                 self.particles.append(
                     WeatherParticle(
                         x=x,
                         y=y,
                         vx=random.uniform(-9.0, -5.0) * speed_mult,
-                        vy=random.uniform(14.5, 21.0) * speed_mult,
-                        char="/",
+                        vy=(
+                            random.uniform(18.0, 27.0)
+                            if self.condition == WeatherCondition.THUNDERSTORM_HAIL
+                            else random.uniform(14.5, 21.0) * speed_mult
+                        ),
+                        char=(
+                            "o"
+                            if self.condition == WeatherCondition.THUNDERSTORM_HAIL
+                            else "."
+                            if self.condition == WeatherCondition.DRIZZLE
+                            else "/"
+                        ),
                     )
                 )
 
@@ -384,8 +429,10 @@ class WeatherSystem:
 
         self.time += dt
 
-        wind_factor = 1.8 if condition == WeatherCondition.STORM else (
-            1.3 if condition in (WeatherCondition.RAIN, WeatherCondition.CLOUDY) else 0.65
+        wind_factor = 1.8 if condition in THUNDERSTORM_CONDITIONS else (
+            1.3
+            if condition in RAIN_CONDITIONS or condition in CLOUD_CONDITIONS
+            else 0.65
         )
         for cloud in self.clouds:
             cloud.x += cloud.speed * wind_factor * dt
@@ -394,7 +441,10 @@ class WeatherSystem:
                 cloud.y = random.randint(2, max(3, min(7, int(sea_level_y * 0.36))))
 
         # Gabbiani: attivi solo con CLEAR o CLOUDY; volano via rapidamente con RAIN/SNOW/STORM
-        calm_sky = condition in (WeatherCondition.CLEAR, WeatherCondition.CLOUDY)
+        calm_sky = condition in (
+            WeatherCondition.CLEAR,
+            WeatherCondition.PARTLY_CLOUDY,
+        )
         for gull in self.seagulls:
             gull.update(dt, fleeing=not calm_sky)
         self.seagulls = [g for g in self.seagulls if not g.is_offscreen(self.width)]
@@ -411,12 +461,21 @@ class WeatherSystem:
 
         self._spawn_particles(sea_level_y)
         for p in self.particles:
-            if condition == WeatherCondition.SNOW:
+            if condition in SNOW_CONDITIONS:
                 p.phase += dt * 2.4
                 p.x += (p.vx + math.sin(p.phase) * 1.3) * dt
             else:
                 p.x += p.vx * dt
             p.y += p.vy * dt
+
+            if condition == WeatherCondition.FOG:
+                if p.x < -5:
+                    p.x = float(self.width + 3)
+                elif p.x > self.width + 8:
+                    p.x = -3.0
+                if p.y < 1 or p.y >= sea_level_y:
+                    p.y = random.uniform(2.0, max(2.0, float(sea_level_y - 1)))
+                continue
 
             if p.y >= sea_level_y:
                 p.y = random.uniform(1.0, 3.0)
@@ -426,7 +485,7 @@ class WeatherSystem:
             elif p.x > self.width + 8:
                 p.x = 0.0
 
-        if condition == WeatherCondition.STORM:
+        if condition in THUNDERSTORM_CONDITIONS:
             if self.lightning_timer > 0.0:
                 self.lightning_timer = max(0.0, self.lightning_timer - dt)
                 self.flash_intensity = max(0.0, self.flash_intensity - dt * 3.8)
@@ -505,7 +564,11 @@ class WeatherSystem:
         celestial_y = 2
 
         # 1. Stelle discrete di NOTTE
-        if not is_day and self.condition in (WeatherCondition.CLEAR, WeatherCondition.CLOUDY):
+        if not is_day and self.condition in (
+            WeatherCondition.CLEAR,
+            WeatherCondition.PARTLY_CLOUDY,
+            WeatherCondition.CLOUDY,
+        ):
             for star in self.stars:
                 if star.y >= sea_level_y - 2:
                     continue
@@ -530,7 +593,10 @@ class WeatherSystem:
                 )
 
         # 2. Sole o Luna in posizione fissa
-        if self.condition in (WeatherCondition.CLEAR, WeatherCondition.CLOUDY):
+        if self.condition in (
+            WeatherCondition.CLEAR,
+            WeatherCondition.PARTLY_CLOUDY,
+        ):
             if is_day:
                 self._draw_animated_sun(renderer, celestial_x, celestial_y)
             else:
@@ -542,25 +608,32 @@ class WeatherSystem:
                 renderer.draw_text(glyph, lx, ly, COLOR_LIGHTNING, bold=True)
 
         # 4. Nuvole
-        if self.condition in (WeatherCondition.RAIN, WeatherCondition.STORM):
+        if self.condition in RAIN_CONDITIONS or self.condition in THUNDERSTORM_CONDITIONS:
             cloud_color = COLOR_DARK_CLOUD
+        elif self.condition == WeatherCondition.FOG:
+            cloud_color = (150, 165, 175)
         elif is_day:
             cloud_color = COLOR_CLOUD_DAY
         else:
             cloud_color = COLOR_CLOUD
 
-        clouds_to_draw = (
-            self.clouds[: max(1, len(self.clouds) // 2)]
-            if self.condition == WeatherCondition.CLEAR
-            else self.clouds
-        )
+        if self.condition == WeatherCondition.CLEAR:
+            clouds_to_draw = self.clouds[: max(1, len(self.clouds) // 4)]
+        elif self.condition == WeatherCondition.PARTLY_CLOUDY:
+            clouds_to_draw = self.clouds[: max(1, len(self.clouds) // 2)]
+        else:
+            clouds_to_draw = self.clouds
         for cloud in clouds_to_draw:
             renderer.draw_sprite(
                 cloud.sprite,
                 int(round(cloud.x)),
                 cloud.y,
                 cloud_color,
-                bold=(is_day and self.condition == WeatherCondition.CLEAR),
+                bold=(
+                    is_day
+                    and self.condition
+                    in (WeatherCondition.CLEAR, WeatherCondition.PARTLY_CLOUDY)
+                ),
             )
 
         # 5. Gabbiani ('/^v^\') in bianco brillante rgb(255, 255, 255) tra le righe 2 e 8
@@ -568,7 +641,7 @@ class WeatherSystem:
             gull.draw(renderer)
 
         # 6. Particelle di pioggia o neve
-        if self.condition == WeatherCondition.SNOW:
+        if self.condition in SNOW_CONDITIONS:
             for p in self.particles:
                 renderer.draw_text(
                     p.char,
@@ -577,7 +650,16 @@ class WeatherSystem:
                     COLOR_SNOW,
                     bold=True,
                 )
-        elif self.condition in (WeatherCondition.RAIN, WeatherCondition.STORM):
+        elif self.condition == WeatherCondition.FOG:
+            for p in self.particles:
+                renderer.draw_text(
+                    p.char,
+                    int(round(p.x)),
+                    int(round(p.y)),
+                    (170, 185, 195),
+                    bold=False,
+                )
+        elif self.condition in RAIN_CONDITIONS or self.condition in THUNDERSTORM_CONDITIONS:
             for p in self.particles:
                 renderer.draw_text(
                     p.char,

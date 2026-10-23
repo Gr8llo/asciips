@@ -41,13 +41,23 @@ asciiships/
 ## 4. Requisiti Funzionali Dettagliati
 CLI e Parametri di Avvio (navi.py)Lo script deve accettare argomenti con argparse:
 --city: Nome della città per il meteo (default: "Bologna").
---fps: Frame rate di esecuzione (default: 25).
+--fps: Frame rate di esecuzione (default: 5, minimo supportato: 5, massimo: 120).
 --max-ships: Numero massimo di navi contemporanee a schermo (default: 3).
---force-weather: Flag opzionale di debug (clear, rain, snow, storm) per simulare meteo senza rete.
+--force-weather: Flag opzionale di debug per simulare uno dei 12 stati meteo senza rete.
+--force-weather storm resta un alias compatibile per thunderstorm. Il tasto W scorre i 12 stati e poi torna al meteo live.
+Refresh: il tasto F2 diminuisce e F3 aumenta il refresh in passi di 5 FPS (limiti 5-120); il menu mostra il controllo. I tasti +/- continuano a regolare il numero di navi.
+Tema: automatico secondo giorno/notte della città; il tasto T scorre Auto, Light e Dark (G/N restano alias) e il menu mostra il controllo.
 ## Modulo Meteo Asincrono (weather_thread.py)
-API usata: Open-Meteo (endpoint geocoding + endpoint forecast, nessun token richiesto).Frequenza aggiornamento: Polling ogni 10 minuti (600 secondi).Architettura: Thread threading.Thread(daemon=True) con scrittura thread-safe su una struttura dati condivisa (WeatherState).Mappatura Meteo:WMO 0: Sereno/Soleggiato (sole ad arco, mare calmo).WMO 1-3: Nuvoloso (nuvole scorrevoli, vento moderato).WMO 51-67, 80-82: Pioggia (particelle oblique, onde alte).WMO 71-77, 85-86: Neve (particelle lente, banchisa ghiacciata).WMO 95-99: Temporale (fulmini con flash a schermo, mare molto mosso).
+API usata: Open-Meteo (geocoding e forecast, senza token). Il thread daemon aggiorna ogni 10 minuti, includendo ora locale, indicatore giorno/notte, temperatura, temperatura percepita, umidita' e vento.
+
+Stati meteo: `clear`, `partly-cloudy`, `overcast`, `cloudy`, `drizzle`, `rain`, `rain-showers`, `snow`, `snow-grains`, `fog`, `thunderstorm`, `thunderstorm-hail`. Mappatura WMO: 0 sereno; 1-2 parzialmente nuvoloso (nuvoloso di notte); 3 coperto; 45/48 nebbia; 51-57 pioviggine; 61-67 pioggia; 71-76 e 85-86 neve; 77 granuli di neve; 80-82 rovesci; 95/97/98 temporale; 96/99 temporale con grandine.
+
+Con `snow` e `snow-grains` il mare si ghiaccia e le navi appaiono come rompighiaccio.
 ## Comportamento Navale e Battaglia (ship.py, projectile.py)
-Non-determinismo: Le navi spawnano a intervalli casuali dai margini dello schermo con velocità e sprite diversi.Vele dinamiche: Ogni nave seleziona casualmente una stringa da sail_banners in phrases.json e la centra sulle vele ASCII.Cannoneggiamento verbale: Quando due navi sono a distanza di tiro, viene lanciato a intervalli casuali un proiettile contenente una stringa da cannon_insults.Fisica proiettile: Moto parabolico ($y(t) = y_0 + v_y t - \frac{1}{2} g t^2$).Danni e Affondamento:Ogni colpo riduce i punti scafo della nave bersaglio.A 0 HP, la nave entra nello stato SINKING: sprite danneggiato/fumo, scorrimento verso il basso oltre la linea del mare e rimozione.Timer casuale per il respawn di una nuova nave.
+Le navi si muovono automaticamente lungo la superficie prospettica del mare, sia all'orizzonte sia sulle onde visibili piu' in basso; restano sopra il pelo dell'acqua e seguono il profilo della propria corsia. Ogni nave viene disegnata con la dimensione ASCII originale e come sprite rigido. Tutte le onde, inclusa la cresta dell'orizzonte, vengono disegnate dietro alle navi per non coprirne vele e scafi. Quando affonda, la nave resta sul posto e scompare sotto la superficie locale, senza scendere fino al fondo dello schermo. Le navi evitano collisioni sulla stessa corsia e mostrano un profilo ASCII a tre quarti durante le virate, tornando alla vista laterale in navigazione. Velocita' navale dimezzata; intervallo tra i colpi raddoppiato.
+
+## HUD e modalita' visiva
+Mostra l'orologio con l'ora locale della citta' e condizione, temperatura, temperatura percepita, umidita' e vento, senza titolo ASCII. In Auto il tema passa a Light di giorno e Dark dopo il tramonto secondo il segnale locale Open-Meteo.
 ## File Dati Iniziale (phrases.json)JSON{
   "sail_banners": [
     "AUDACES IUVAT",

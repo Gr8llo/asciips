@@ -14,6 +14,8 @@ from config import (
     DEFAULT_CITY,
     DEFAULT_FPS,
     DEFAULT_MAX_SHIPS,
+    MAX_FPS,
+    MIN_FPS,
     TimeOfDay,
     WeatherCondition,
 )
@@ -30,6 +32,16 @@ def _normalize_time_choice(val: str) -> TimeOfDay:
         return TimeOfDay.NIGHT
     raise argparse.ArgumentTypeError(
         f"Valore non valido '{val}'. Usa: day, night, giorno, notte."
+    )
+
+
+def _normalize_weather_choice(val: str) -> str:
+    """Mantiene `storm` come alias storico di `thunderstorm`."""
+    normalized = val.strip().lower()
+    return (
+        WeatherCondition.THUNDERSTORM.value
+        if normalized == "storm"
+        else normalized
     )
 
 
@@ -59,10 +71,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--force-weather",
-        type=str.lower,
-        choices=[c.value for c in WeatherCondition],
+        type=_normalize_weather_choice,
+        choices=[c.value for c in WeatherCondition] + ["storm"],
         default=None,
-        help="Forza una condizione meteo di debug (clear, cloudy, rain, snow, storm) senza dipendere dalla rete.",
+        help="Forza una condizione meteo di debug senza dipendere dalla rete.",
     )
 
     time_group = parser.add_mutually_exclusive_group()
@@ -95,7 +107,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Funzione principale di avvio di AsciiShips."""
     args = parse_args(argv)
 
-    fps = max(5, min(120, args.fps))
+    fps = max(MIN_FPS, min(MAX_FPS, args.fps))
     max_ships = max(2, min(10, args.max_ships))
     forced_cond = (
         WeatherCondition(args.force_weather)

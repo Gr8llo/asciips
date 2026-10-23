@@ -1,6 +1,6 @@
 """
 engine/loop.py - Game loop principale su asciimatics, gestione spawn/respawn navi,
-collisioni balistiche, ridimensionamento terminale (SIGWINCH), Top Bar minimale
+collisioni balistiche, ridimensionamento terminale (SIGWINCH), HUD meteo multiriga
 e Menù modale in sovraimpressione ([M] / [Esc]).
 """
 
@@ -13,9 +13,14 @@ from typing import Dict, List, Tuple
 from asciimatics.screen import Screen
 
 from config import (
+    AppearanceMode,
     COLOR_EXPLOSION,
     COLOR_HUD_TEXT,
     COLOR_WAVE_CREST,
+    DEFAULT_FPS,
+    FPS_STEP,
+    MAX_FPS,
+    MIN_FPS,
     PHRASES_FILE,
     RGB,
     SHIP_FIRE_COOLDOWN_MAX,
@@ -25,6 +30,7 @@ from config import (
     SHIP_PALETTES,
     SHIP_RESPAWN_DELAY_MAX,
     SHIP_RESPAWN_DELAY_MIN,
+    SNOW_CONDITIONS,
 )
 from engine.renderer import Renderer
 from engine.weather_thread import WeatherSnapshot, WeatherState
@@ -83,6 +89,44 @@ def _format_duration(seconds: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+def _weather_hud_lines(snap: WeatherSnapshot) -> Tuple[str, ...]:
+    """Prepara titolo e letture meteo per l'intestazione multiriga."""
+    local_clock = (
+        snap.city_local_time.strftime("%H:%M:%S")
+        if snap.city_local_time is not None
+        else "N/D"
+    )
+    temperature = (
+        f"{snap.temperature_c:.1f}°C"
+        if snap.temperature_c is not None
+        else "N/D"
+    )
+    apparent = (
+        f"{snap.apparent_temperature_c:.1f}°C"
+        if snap.apparent_temperature_c is not None
+        else "N/D"
+    )
+    humidity = (
+        f"{snap.relative_humidity_pct:.0f}%"
+        if snap.relative_humidity_pct is not None
+        else "N/D"
+    )
+    mode = snap.appearance_mode.value.upper()
+    if snap.appearance_mode == AppearanceMode.AUTO:
+        mode += f"/{'LIGHT' if snap.is_day else 'DARK'}"
+    return (
+        f"{snap.city} | {local_clock} | {mode}",
+        (
+            f"{snap.condition.value.upper()} | "
+            f"{temperature} | Percepita {apparent}"
+        ),
+        (
+            f"Umidita' {humidity} | Vento {snap.wind_speed_kmh:.0f} km/h | "
+            "[W] Meteo [T] Tema [M] Menu'"
+        ),
+    )
+
+
 class NavalBattleWorld:
     """
     Coordina tutte le entità della simulazione (meteo, mare, navi, proiettili),
@@ -95,14 +139,14 @@ class NavalBattleWorld:
         height: int,
         weather_state: WeatherState,
         max_ships: int,
-        target_fps: int = 25,
+        target_fps: int = DEFAULT_FPS,
     ) -> None:
         self.width: int = width
         self.height: int = height
         self.weather_state: WeatherState = weather_state
         self.max_ships: int = max(2, max_ships)
-        self.target_fps: int = target_fps
-        self.current_fps: float = float(target_fps)
+        self.target_fps: int = max(MIN_FPS, min(MAX_FPS, target_fps))
+        self.current_fps: float = float(self.target_fps)
         self.session_start_time: float = time.monotonic()
         self.menu_open: bool = False
 
@@ -178,7 +222,22 @@ class NavalBattleWorld:
         else:
             ship.x = 2.0 if direction > 0 else float(max(6, self.width - ship.width - 2))
 
-        ship.y = self.sea.surface_y_at(ship.center_x) - (ship.height - 1.0)
+        max_depth = max(
+            0.0,
+            float(self.sea.height - self.sea.base_sea_y - 2),
+        )
+        ship.max_visible_depth = max(1.0, max_depth)
+        if initial_placement:
+            ship.depth_offset = max_depth * (
+                slot_idx / max(1, total_slots - 1)
+            )
+        else:
+            ship.depth_offset = random.uniform(0.0, max_depth)
+        ship.depth_target = ship.depth_offset
+        ship.y = (
+            self.sea.surface_y_at(ship.center_x, ship.depth_offset)
+            - ship.visual_height
+        )
         self.ships.append(ship)
 
     def adjust_max_ships(self, delta: int) -> int:
@@ -197,6 +256,24 @@ class NavalBattleWorld:
                 : max(0, self.max_ships - len(self.ships))
             ]
         return self.max_ships
+
+    def adjust_target_fps(self, direction: int) -> int:
+        """Regola il refresh obiettivo a passi di FPS_STEP, entro i limiti supportati."""
+        self.target_fps = max(
+            MIN_FPS,
+            min(MAX_FPS, self.target_fps + direction * FPS_STEP),
+        )
+        return self.target_fps
+
+    def handle_refresh_key(self, key: int) -> bool:
+        """Gestisce i tasti funzione dedicati alla regolazione del refresh."""
+        if key == Screen.KEY_F2:
+            self.adjust_target_fps(-1)
+            return True
+        if key == Screen.KEY_F3:
+            self.adjust_target_fps(1)
+            return True
+        return False
 
     def _fire_from_ship(self, attacker: Ship, target: Ship) -> None:
         """Lancia una frase-proiettile da `attacker` a `target` generando lo sbuffo di fumo."""
@@ -320,7 +397,13 @@ class NavalBattleWorld:
         # 2. Aggiorna navi e gestisci affondamenti/respawn
         surviving_ships: List[Ship] = []
         for ship in self.ships:
-            ship.update(dt, self.sea, self.width)
+            ship.update(
+                dt,
+                self.sea,
+                self.width,
+                tuple(other for other in self.ships if other is not ship),
+                icebreaker=condition in SNOW_CONDITIONS,
+            )
             if ship.state == ShipState.SUNK:
                 self.respawn_timers.append(
                     random.uniform(SHIP_RESPAWN_DELAY_MIN, SHIP_RESPAWN_DELAY_MAX)
@@ -365,6 +448,11 @@ class NavalBattleWorld:
         """
         temp_str = (
             f"{snap.temperature_c:.1f}°C" if snap.temperature_c is not None else "N/D"
+        )
+        apparent_str = (
+            f"{snap.apparent_temperature_c:.1f}°C"
+            if snap.apparent_temperature_c is not None
+            else "N/D"
         )
         if snap.latitude is not None and snap.longitude is not None:
             coords_str = f"({snap.latitude:.2f}°N, {snap.longitude:.2f}°E)"
@@ -414,14 +502,30 @@ class NavalBattleWorld:
             ),
             (
                 _pad_row(
-                    f"   Meteo corrente           : {snap.condition.value.upper()} | {tod_label} ({temp_str}, {snap.wind_speed_kmh:.0f} km/h)"
+                    f"   Meteo corrente           : {snap.condition.value.upper()} | {tod_label} ({temp_str}, percepita {apparent_str})"
                 ),
                 COLOR_MENU_TEXT,
                 False,
             ),
             (
                 _pad_row(
-                    f"   FPS / Tempo di sessione  : {self.current_fps:.0f} FPS | {session_time}"
+                    f"   Umidita' / Vento         : {snap.relative_humidity_pct:.0f}% | {snap.wind_speed_kmh:.0f} km/h"
+                    if snap.relative_humidity_pct is not None
+                    else f"   Umidita' / Vento         : N/D | {snap.wind_speed_kmh:.0f} km/h"
+                ),
+                COLOR_MENU_TEXT,
+                False,
+            ),
+            (
+                _pad_row(
+                    f"   Ora locale               : {snap.city_local_time.strftime('%H:%M:%S') if snap.city_local_time is not None else 'N/D'} | Tema {snap.appearance_mode.value.upper()}"
+                ),
+                COLOR_MENU_TEXT,
+                False,
+            ),
+            (
+                _pad_row(
+                    f"   FPS attuali / obiettivo  : {self.current_fps:.0f} / {self.target_fps} FPS | {session_time}"
                 ),
                 COLOR_MENU_TEXT,
                 False,
@@ -444,7 +548,12 @@ class NavalBattleWorld:
                 False,
             ),
             (
-                _pad_row("   [G] / [N] : Toggle Giorno / Notte"),
+                _pad_row("   [F2]/[F3]: Refresh -/+ 5 FPS (limiti 5-120)"),
+                COLOR_MENU_KEY,
+                False,
+            ),
+            (
+                _pad_row("   [T]       : Tema Auto / Light / Dark"),
                 COLOR_MENU_KEY,
                 False,
             ),
@@ -483,9 +592,8 @@ class NavalBattleWorld:
         """
         Disegna l'intera scena nell'ordine rigoroso di Z-index a ogni frame:
         1. Cielo, stelle, luna/sole, nuvole e GABBIANI (sfondo).
-        2. Mare di fondo e PESCI (sotto il livello del mare).
-        3. NAVI e proiettili/fumo (primo piano, ben visibili sopra la linea di galleggiamento).
-        4. Cresta delle onde in primo piano sullo scafo.
+        2. Mare di fondo, PESCI e tutte le onde dietro le navi.
+        3. NAVI e proiettili/fumo in primo piano.
         5. Header superiore minimale e, se attivo, Menù modale in sovraimpressione.
         """
         snap = self.weather_state.snapshot()
@@ -498,6 +606,8 @@ class NavalBattleWorld:
 
         # 2. Mare di fondo e PESCI (sotto il livello del mare)
         self.sea.draw_subsurface_volume(renderer, is_day=snap.is_day)
+        self.sea.draw_perspective_wave_tracks(renderer, is_day=snap.is_day)
+        self.sea.draw_surface_crests(renderer, is_day=snap.is_day)
 
         # 3. NAVI e proiettili/fumo (primo piano, ben visibili sopra la linea di galleggiamento)
         for ship in self.ships:
@@ -532,28 +642,19 @@ class NavalBattleWorld:
                     transparent=True,
                 )
 
-        # 4. Cresta delle onde in primo piano sullo scafo
-        self.sea.draw_surface_crests(renderer, is_day=snap.is_day)
+        # 4. Pannello meteo in alto, senza titolo.
+        for row, line in enumerate(_weather_hud_lines(snap)):
+            renderer.draw_text(
+                line[: self.width].ljust(self.width),
+                0,
+                row,
+                COLOR_MENU_TEXT,
+                bg_rgb=COLOR_MENU_BG,
+                bold=True,
+                transparent=False,
+            )
 
-        # 5. Header superiore minimale ad alto contrasto (riga 0)
-        temp_str = (
-            f"{snap.temperature_c:.1f}°C" if snap.temperature_c is not None else "N/D"
-        )
-        top_bar = (
-            f" AsciiShips | {snap.city} | Meteo: {snap.condition.value.upper()} "
-            f"({temp_str}, Vento {snap.wind_speed_kmh:.0f} km/h) | [M] Menù "
-        )
-        renderer.draw_text(
-            top_bar[: self.width].ljust(self.width),
-            0,
-            0,
-            (255, 245, 200),
-            bg_rgb=COLOR_MENU_BG,
-            bold=True,
-            transparent=False,
-        )
-
-        # 6. Menù modale in sovraimpressione se aperto ([M])
+        # 5. Menù modale in sovraimpressione se aperto ([M])
         if self.menu_open:
             self._draw_menu_overlay(renderer, snap)
 
@@ -567,7 +668,6 @@ def run_asciimatics_loop(
     Avvia e gestisce il game loop principale su asciimatics.screen.Screen,
     intercettando il ridimensionamento della finestra (SIGWINCH) senza perdere lo stato.
     """
-    frame_duration = 1.0 / max(1, fps)
     world: NavalBattleWorld | None = None
 
     def _screen_main(screen: Screen) -> None:
@@ -592,7 +692,7 @@ def run_asciimatics_loop(
 
             now = time.monotonic()
             raw_dt = max(0.001, now - last_time)
-            dt = min(0.1, raw_dt)
+            dt = min(max(0.1, 1.0 / world.target_fps), raw_dt)
             last_time = now
             world.current_fps = 0.85 * world.current_fps + 0.15 * min(240.0, 1.0 / raw_dt)
 
@@ -600,7 +700,9 @@ def run_asciimatics_loop(
                 ev = screen.get_key()
                 if ev is None:
                     break
-                if ev in (ord("m"), ord("M")):
+                if world.handle_refresh_key(ev):
+                    pass
+                elif ev in (ord("m"), ord("M")):
                     world.toggle_menu()
                 elif ev == Screen.KEY_ESCAPE:
                     if world.menu_open:
@@ -619,14 +721,14 @@ def run_asciimatics_loop(
                 elif ev in (ord("-"), ord("_")):
                     world.adjust_max_ships(-1)
                 elif ev in (ord("g"), ord("G"), ord("n"), ord("N"), ord("t"), ord("T")):
-                    weather_state.toggle_time_of_day()
+                    weather_state.cycle_appearance_mode()
 
             world.update(dt)
             world.draw(renderer)
             screen.refresh()
 
             elapsed = time.monotonic() - now
-            sleep_for = frame_duration - elapsed
+            sleep_for = 1.0 / world.target_fps - elapsed
             if sleep_for > 0:
                 time.sleep(sleep_for)
 

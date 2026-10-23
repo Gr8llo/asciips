@@ -3,9 +3,10 @@ config.py - Parametri globali, palette RGB naturali (Giorno e Notte), costanti f
 """
 
 from __future__ import annotations
+
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, Tuple
 
 # Percorsi di base
 BASE_DIR: Path = Path(__file__).resolve().parent
@@ -13,7 +14,10 @@ PHRASES_FILE: Path = BASE_DIR / "phrases.json"
 
 # Parametri di default CLI e runtime
 DEFAULT_CITY: str = "Bologna"
-DEFAULT_FPS: int = 25
+MIN_FPS: int = 5
+MAX_FPS: int = 120
+FPS_STEP: int = 5
+DEFAULT_FPS: int = MIN_FPS
 DEFAULT_MAX_SHIPS: int = 3
 WEATHER_POLL_INTERVAL_SEC: int = 600  # 10 minuti (600 secondi)
 HTTP_TIMEOUT_SEC: int = 8
@@ -26,45 +30,84 @@ FORECAST_API_URL: str = "https://api.open-meteo.com/v1/forecast"
 class WeatherCondition(str, Enum):
     """Condizioni meteo supportate dal motore."""
     CLEAR = "clear"
+    PARTLY_CLOUDY = "partly-cloudy"
+    OVERCAST = "overcast"
     CLOUDY = "cloudy"
+    DRIZZLE = "drizzle"
     RAIN = "rain"
+    RAIN_SHOWERS = "rain-showers"
     SNOW = "snow"
-    STORM = "storm"
+    SNOW_GRAINS = "snow-grains"
+    FOG = "fog"
+    THUNDERSTORM = "thunderstorm"
+    THUNDERSTORM_HAIL = "thunderstorm-hail"
+    STORM = "thunderstorm"
 
 
 class TimeOfDay(str, Enum):
-    """Fascia oraria (giorno o notte) per illuminazione di cielo e mare."""
+    """Fascia oraria (giorno o notte) derivata dal meteo locale."""
     DAY = "day"
     NIGHT = "night"
 
 
+class AppearanceMode(str, Enum):
+    """Modalita' cromatica automatica o scelta manualmente."""
+    AUTO = "auto"
+    LIGHT = "light"
+    DARK = "dark"
+
+
+RAIN_CONDITIONS = {
+    WeatherCondition.DRIZZLE,
+    WeatherCondition.RAIN,
+    WeatherCondition.RAIN_SHOWERS,
+}
+SNOW_CONDITIONS = {WeatherCondition.SNOW, WeatherCondition.SNOW_GRAINS}
+THUNDERSTORM_CONDITIONS = {
+    WeatherCondition.THUNDERSTORM,
+    WeatherCondition.THUNDERSTORM_HAIL,
+}
+PRECIPITATION_CONDITIONS = RAIN_CONDITIONS | SNOW_CONDITIONS | THUNDERSTORM_CONDITIONS
+CLOUD_CONDITIONS = {
+    WeatherCondition.PARTLY_CLOUDY,
+    WeatherCondition.OVERCAST,
+    WeatherCondition.CLOUDY,
+    WeatherCondition.FOG,
+}
+
+
 # Mappatura codici WMO (World Meteorological Organization) secondo PRD
-WMO_CLEAR_CODES: Set[int] = {0}
-WMO_CLOUDY_CODES: Set[int] = {1, 2, 3, 45, 48}
-WMO_RAIN_CODES: Set[int] = set(range(51, 68)) | {80, 81, 82}
-WMO_SNOW_CODES: Set[int] = set(range(71, 78)) | {85, 86}
-WMO_STORM_CODES: Set[int] = {95, 96, 97, 98, 99}
-
-
-def map_wmo_to_condition(wmo_code: int) -> WeatherCondition:
+def map_wmo_to_condition(
+    wmo_code: int, *, is_day: bool | None = None
+) -> WeatherCondition:
     """Converte un codice meteo WMO nella corrispondente condizione di gioco."""
-    if wmo_code in WMO_CLEAR_CODES:
+    if wmo_code == 0:
         return WeatherCondition.CLEAR
-    if wmo_code in WMO_CLOUDY_CODES:
-        return WeatherCondition.CLOUDY
-    if wmo_code in WMO_RAIN_CODES:
+    if wmo_code in (1, 2):
+        return (
+            WeatherCondition.CLOUDY
+            if is_day is False
+            else WeatherCondition.PARTLY_CLOUDY
+        )
+    if wmo_code == 3:
+        return WeatherCondition.OVERCAST
+    if wmo_code in (45, 48):
+        return WeatherCondition.FOG
+    if wmo_code in (51, 53, 55, 56, 57):
+        return WeatherCondition.DRIZZLE
+    if wmo_code in (61, 63, 65, 66, 67):
         return WeatherCondition.RAIN
-    if wmo_code in WMO_SNOW_CODES:
+    if wmo_code in (71, 73, 75, 76, 85, 86):
         return WeatherCondition.SNOW
-    if wmo_code in WMO_STORM_CODES:
-        return WeatherCondition.STORM
-    if 50 <= wmo_code < 70:
-        return WeatherCondition.RAIN
-    if 70 <= wmo_code < 90:
-        return WeatherCondition.SNOW
-    if wmo_code >= 90:
-        return WeatherCondition.STORM
-    return WeatherCondition.CLOUDY
+    if wmo_code == 77:
+        return WeatherCondition.SNOW_GRAINS
+    if wmo_code in (80, 81, 82):
+        return WeatherCondition.RAIN_SHOWERS
+    if wmo_code in (95, 97, 98):
+        return WeatherCondition.THUNDERSTORM
+    if wmo_code in (96, 99):
+        return WeatherCondition.THUNDERSTORM_HAIL
+    return WeatherCondition.OVERCAST
 
 
 # Tipo colore RGB 24-bit
@@ -73,10 +116,17 @@ RGB = Tuple[int, int, int]
 # Palette Cielo Naturale (Top -> Horizon)
 SKY_GRADIENTS: Dict[WeatherCondition, Tuple[RGB, RGB]] = {
     WeatherCondition.CLEAR: ((45, 115, 195), (120, 185, 235)),
+    WeatherCondition.PARTLY_CLOUDY: ((55, 115, 175), (125, 175, 215)),
+    WeatherCondition.OVERCAST: ((48, 70, 98), (105, 125, 148)),
     WeatherCondition.CLOUDY: ((40, 75, 125), (95, 135, 175)),
+    WeatherCondition.DRIZZLE: ((40, 60, 86), (86, 116, 145)),
     WeatherCondition.RAIN: ((25, 45, 75), (65, 95, 130)),
+    WeatherCondition.RAIN_SHOWERS: ((30, 48, 78), (74, 108, 145)),
     WeatherCondition.SNOW: ((45, 75, 115), (130, 160, 195)),
-    WeatherCondition.STORM: ((10, 18, 35), (30, 45, 70)),
+    WeatherCondition.SNOW_GRAINS: ((70, 100, 135), (150, 175, 200)),
+    WeatherCondition.FOG: ((100, 115, 125), (165, 175, 180)),
+    WeatherCondition.THUNDERSTORM: ((10, 18, 35), (30, 45, 70)),
+    WeatherCondition.THUNDERSTORM_HAIL: ((16, 22, 40), (42, 48, 72)),
 }
 
 NIGHT_SKY_GRADIENT: Tuple[RGB, RGB] = ((5, 10, 25), (15, 25, 45))
@@ -84,19 +134,33 @@ NIGHT_SKY_GRADIENT: Tuple[RGB, RGB] = ((5, 10, 25), (15, 25, 45))
 # Palette Mare Notturno (Surface -> Deep)
 SEA_GRADIENTS: Dict[WeatherCondition, Tuple[RGB, RGB]] = {
     WeatherCondition.CLEAR: ((30, 130, 190), (10, 45, 95)),
+    WeatherCondition.PARTLY_CLOUDY: ((28, 120, 175), (8, 42, 88)),
+    WeatherCondition.OVERCAST: ((27, 100, 145), (8, 38, 72)),
     WeatherCondition.CLOUDY: ((25, 115, 170), (8, 40, 85)),
+    WeatherCondition.DRIZZLE: ((25, 110, 160), (7, 37, 78)),
     WeatherCondition.RAIN: ((22, 105, 160), (6, 35, 75)),
+    WeatherCondition.RAIN_SHOWERS: ((24, 108, 162), (7, 36, 76)),
     WeatherCondition.SNOW: ((50, 150, 210), (14, 55, 110)),
-    WeatherCondition.STORM: ((20, 95, 145), (5, 28, 65)),
+    WeatherCondition.SNOW_GRAINS: ((62, 155, 200), (20, 65, 115)),
+    WeatherCondition.FOG: ((65, 120, 145), (32, 75, 100)),
+    WeatherCondition.THUNDERSTORM: ((20, 95, 145), (5, 28, 65)),
+    WeatherCondition.THUNDERSTORM_HAIL: ((24, 98, 145), (8, 32, 68)),
 }
 
 # Palette Mare Diurno: da turchese/ciano brillante rgb(30, 160, 210) a blu oceano rgb(15, 80, 140)
 DAY_SEA_GRADIENTS: Dict[WeatherCondition, Tuple[RGB, RGB]] = {
     WeatherCondition.CLEAR: ((30, 160, 210), (15, 80, 140)),
+    WeatherCondition.PARTLY_CLOUDY: ((30, 150, 200), (15, 75, 135)),
+    WeatherCondition.OVERCAST: ((28, 125, 170), (12, 62, 110)),
     WeatherCondition.CLOUDY: ((28, 145, 195), (14, 72, 130)),
+    WeatherCondition.DRIZZLE: ((28, 138, 188), (13, 67, 122)),
     WeatherCondition.RAIN: ((25, 130, 180), (12, 65, 120)),
+    WeatherCondition.RAIN_SHOWERS: ((27, 135, 186), (13, 66, 120)),
     WeatherCondition.SNOW: ((55, 175, 225), (20, 90, 150)),
-    WeatherCondition.STORM: ((22, 115, 165), (10, 55, 105)),
+    WeatherCondition.SNOW_GRAINS: ((75, 180, 220), (30, 98, 150)),
+    WeatherCondition.FOG: ((100, 150, 170), (65, 105, 130)),
+    WeatherCondition.THUNDERSTORM: ((22, 115, 165), (10, 55, 105)),
+    WeatherCondition.THUNDERSTORM_HAIL: ((30, 118, 165), (12, 57, 105)),
 }
 
 # Colori RGB per gli elementi atmosferici e marini
@@ -219,22 +283,29 @@ GRAVITY: float = 9.81          # Accelerazione di gravità per traiettoria parab
 # Parametri onde per condizione meteo: (ampiezza, frequenza_spaziale, velocità_fase, cresta_prob)
 WAVE_PARAMS: Dict[WeatherCondition, Tuple[float, float, float, float]] = {
     WeatherCondition.CLEAR: (0.42, 0.13, 1.35, 0.12),
+    WeatherCondition.PARTLY_CLOUDY: (0.52, 0.14, 1.55, 0.16),
+    WeatherCondition.OVERCAST: (0.62, 0.15, 1.8, 0.20),
     WeatherCondition.CLOUDY: (0.68, 0.15, 1.95, 0.22),
+    WeatherCondition.DRIZZLE: (0.72, 0.16, 2.1, 0.25),
     WeatherCondition.RAIN: (1.08, 0.17, 2.65, 0.35),
+    WeatherCondition.RAIN_SHOWERS: (1.22, 0.18, 2.85, 0.40),
     WeatherCondition.SNOW: (0.38, 0.11, 0.95, 0.15),
-    WeatherCondition.STORM: (1.60, 0.20, 3.60, 0.50),
+    WeatherCondition.SNOW_GRAINS: (0.12, 0.10, 0.45, 0.03),
+    WeatherCondition.FOG: (0.28, 0.10, 0.75, 0.08),
+    WeatherCondition.THUNDERSTORM: (1.60, 0.20, 3.60, 0.50),
+    WeatherCondition.THUNDERSTORM_HAIL: (1.72, 0.21, 3.8, 0.55),
 }
 
 # Parametri navali e di combattimento
-SHIP_MIN_SPEED: float = 2.0       # Celle al secondo
-SHIP_MAX_SPEED: float = 4.6       # Celle al secondo
+SHIP_MIN_SPEED: float = 1.0       # Celle al secondo
+SHIP_MAX_SPEED: float = 2.3       # Celle al secondo
 SHIP_MAX_HP: int = 100
 CANNON_DAMAGE_MIN: int = 25
 CANNON_DAMAGE_MAX: int = 40
 SHIP_FIRE_RANGE_MIN: float = 14.0
 SHIP_FIRE_RANGE_MAX: float = 72.0
-SHIP_FIRE_COOLDOWN_MIN: float = 2.2
-SHIP_FIRE_COOLDOWN_MAX: float = 4.8
+SHIP_FIRE_COOLDOWN_MIN: float = 4.4
+SHIP_FIRE_COOLDOWN_MAX: float = 9.6
 SHIP_SINK_SPEED: float = 1.8      # Celle al secondo verso il fondo durante SINKING
-SHIP_RESPAWN_DELAY_MIN: float = 1.5
-SHIP_RESPAWN_DELAY_MAX: float = 4.5
+SHIP_RESPAWN_DELAY_MIN: float = 10.5
+SHIP_RESPAWN_DELAY_MAX: float = 15.5

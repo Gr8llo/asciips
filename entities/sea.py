@@ -22,6 +22,7 @@ from config import (
     COLOR_WAVE_SURFACE,
     COLOR_WAVE_SURFACE_DAY,
     DAY_SEA_GRADIENTS,
+    SNOW_CONDITIONS,
     SEA_GRADIENTS,
     SEA_LEVEL_RATIO,
     WAVE_PARAMS,
@@ -194,7 +195,7 @@ class Sea:
         """Restituisce la riga media dell'orizzonte marino."""
         return max(10, min(self.height - 6, int(self.height * SEA_LEVEL_RATIO)))
 
-    def wave_offset_at(self, x: float) -> float:
+    def wave_offset_at(self, x: float, depth: float = 0.0) -> float:
         """
         Calcola lo scostamento verticale dell'onda nella colonna x al tempo corrente.
         Usa la sovrapposizione di due armoniche sinusoidali per un moto naturale.
@@ -202,21 +203,39 @@ class Sea:
         amp, freq, phase_speed, _ = WAVE_PARAMS.get(
             self.condition, WAVE_PARAMS[WeatherCondition.CLEAR]
         )
-        primary = math.sin(x * freq - self.time * phase_speed)
-        secondary = 0.42 * math.cos(x * (freq * 1.65) + self.time * (phase_speed * 0.6))
+        if self.condition in SNOW_CONDITIONS:
+            amp = min(amp, 0.06)
+        depth_ratio = max(
+            0.0,
+            min(1.0, depth / max(1.0, self.height - self.base_sea_y - 1)),
+        )
+        amp *= 1.0 - 0.72 * depth_ratio
+        depth_phase = depth * 0.12
+        primary = math.sin(x * freq - self.time * phase_speed + depth_phase)
+        secondary = 0.42 * math.cos(
+            x * (freq * 1.65)
+            + self.time * (phase_speed * 0.6)
+            + depth_phase * 1.7
+        )
         return amp * (primary + secondary * 0.55)
 
-    def surface_y_at(self, x: float) -> float:
-        """Restituisce la coordinata Y esatta (float) della superficie del mare in x."""
-        return float(self.base_sea_y) + self.wave_offset_at(x)
+    def surface_y_at(self, x: float, depth: float = 0.0) -> float:
+        """Restituisce la quota del pelo dell'acqua sulla corsia prospettica richiesta."""
+        return float(self.base_sea_y) + depth + self.wave_offset_at(x, depth)
 
-    def get_surface_profile(self) -> List[int]:
-        """Restituisce la lista delle quote intere Y della superficie per ogni colonna x."""
-        return [int(round(self.surface_y_at(float(x)))) for x in range(self.width)]
+    def get_surface_profile(self, depth: float = 0.0) -> List[int]:
+        """Restituisce le quote della superficie per colonna su una corsia di profondita'."""
+        return [
+            int(round(self.surface_y_at(float(x), depth)))
+            for x in range(self.width)
+        ]
 
-    def wave_slope_at(self, x: float) -> float:
+    def wave_slope_at(self, x: float, depth: float = 0.0) -> float:
         """Calcola la derivata spaziale approssimata dell'onda per il rollio navale."""
-        return (self.wave_offset_at(x + 1.5) - self.wave_offset_at(x - 1.5)) / 3.0
+        return (
+            self.wave_offset_at(x + 1.5, depth)
+            - self.wave_offset_at(x - 1.5, depth)
+        ) / 3.0
 
     def update(
         self,
@@ -232,7 +251,7 @@ class Sea:
         self.tick += 1
         self.condition = condition
 
-        if condition == WeatherCondition.SNOW:
+        if condition in SNOW_CONDITIONS:
             for floe in self._ice_floes:
                 floe.x += floe.speed * dt
                 if floe.x > self.width + 4:
@@ -388,10 +407,47 @@ class Sea:
                                     transparent=True,
                                 )
 
+    def draw_perspective_wave_tracks(
+        self, renderer: Renderer, *, is_day: bool = True
+    ) -> None:
+        """Disegna le onde lontane dietro alle navi della scena prospettica."""
+        base_y = self.base_sea_y
+        _, freq, phase_speed, _ = WAVE_PARAMS.get(
+            self.condition, WAVE_PARAMS[WeatherCondition.CLEAR]
+        )
+
+        foam_col = COLOR_WAVE_FOAM_DAY if is_day else COLOR_WAVE_FOAM
+        surf_col = COLOR_WAVE_SURFACE_DAY if is_day else COLOR_WAVE_SURFACE
+
+        sea_depth = max(0, self.height - base_y - 2)
+        track_spacing = max(3, sea_depth // 5)
+        depth = float(track_spacing)
+        while depth < sea_depth:
+            ratio = depth / max(1.0, float(sea_depth))
+            track_color = lerp_rgb(foam_col, COLOR_SEA_TEXTURE, 0.55 + ratio * 0.3)
+            for x in range(self.width):
+                y = int(round(self.surface_y_at(float(x), depth)))
+                if not 0 <= y < self.height:
+                    continue
+                phase_val = math.sin(
+                    x * (freq * 1.1)
+                    - self.time * (phase_speed * 0.8)
+                    + depth * 0.12
+                )
+                if phase_val > 0.5:
+                    glyph = "~" if ratio < 0.45 else "."
+                    renderer.draw_text(
+                        glyph,
+                        x,
+                        y,
+                        track_color,
+                        bold=False,
+                        transparent=True,
+                    )
+            depth += track_spacing
+
     def draw_surface_crests(self, renderer: Renderer, *, is_day: bool = True) -> None:
-        """
-        Disegna la cresta delle onde ('~', '^', '≈') in primo piano sullo scafo.
-        """
+        """Disegna la cresta all'orizzonte davanti allo scafo."""
         base_y = self.base_sea_y
         _, freq, phase_speed, crest_prob = WAVE_PARAMS.get(
             self.condition, WAVE_PARAMS[WeatherCondition.CLEAR]
@@ -425,8 +481,16 @@ class Sea:
 
                 renderer.draw_text(ch, x, y, color, bold=bold, transparent=True)
 
-        # Banchisa ghiacciata se il meteo è SNOW
-        if self.condition == WeatherCondition.SNOW:
+        # Una crosta continua copre le onde durante entrambi gli stati nevosi.
+        if self.condition in SNOW_CONDITIONS:
+            for x in range(self.width):
+                y = int(round(self.surface_y_at(float(x))))
+                if not 0 <= y < self.height:
+                    continue
+                glyph = "=" if (x // 4) % 3 else "_"
+                color = COLOR_ICE_FLOE if x % 11 < 7 else COLOR_WAVE_FOAM_DAY
+                renderer.draw_text(glyph, x, y, color, bold=True, transparent=True)
+
             for floe in self._ice_floes:
                 fx = int(round(floe.x))
                 fy = int(round(self.surface_y_at(floe.x + floe.width * 0.5)))
@@ -438,8 +502,10 @@ class Sea:
                     bold=True,
                     transparent=True,
                 )
+            return
 
     def draw_surface_and_depths(self, renderer: Renderer, *, is_day: bool = True) -> None:
         """Metodo combinato che disegna profondità e superficie."""
         self.draw_subsurface_volume(renderer, is_day=is_day)
+        self.draw_perspective_wave_tracks(renderer, is_day=is_day)
         self.draw_surface_crests(renderer, is_day=is_day)

@@ -27,7 +27,6 @@ from config import (
     COLOR_SHIP_MAST,
     COLOR_SHIP_SAIL,
     COLOR_SHIP_SAIL_DAY,
-    COLOR_SHIP_SUBMERGED,
     COLOR_SHIP_WAKE,
     COLOR_SMOKE,
     COLOR_WAVE_FOAM,
@@ -258,6 +257,13 @@ class Ship:
         self.width: int = len(self.spec.right_art[0])
         self.height: int = len(self.spec.right_art)
         self._build_ascii_art()
+        self.icebreaker: bool = False
+        self.depth_offset: float = 0.0
+        self.depth_target: float = 0.0
+        self.depth_change_timer: float = random.uniform(2.0, 5.0)
+        self.depth_speed: float = random.uniform(1.6, 2.6)
+        self.max_visible_depth: float = 1.0
+        self.three_quarter_timer: float = 0.0
 
     def _get_main_sail_span(self) -> Tuple[int, int]:
         """Restituisce l'intervallo fisso [col_start, col_end) della vela maestra."""
@@ -341,19 +347,38 @@ class Ship:
         return self.x + self.width * 0.5
 
     @property
+    def perspective_scale(self) -> float:
+        """Mantiene la dimensione originale della nave in tutte le corsie."""
+        return 1.0
+
+    @property
+    def visual_width(self) -> int:
+        return max(8, int(round(self.width * self.perspective_scale)))
+
+    @property
+    def visual_height(self) -> int:
+        return max(5, int(round(self.height * self.perspective_scale)))
+
+    @property
+    def visual_left(self) -> float:
+        return self.center_x - self.visual_width * 0.5
+
+    @property
     def cannon_origin(self) -> Tuple[float, float]:
         """Punto di origine dei colpi di cannone sulle bocche di fuoco '[o]'."""
-        deck_y = self.y + (self.height - 2.5)
-        cannon_x = self.center_x + (self.direction * 4.5)
+        deck_y = self.y + (self.visual_height - 2.5)
+        cannon_x = self.center_x + (self.direction * 4.5 * self.perspective_scale)
         return cannon_x, deck_y
 
     def hitbox(self) -> Tuple[float, float, float, float]:
         """Rettangolo di collisione calibrato sulla sagoma reale del veliero."""
+        left = self.visual_left
+        scale = self.perspective_scale
         return (
-            self.x + 2.0,
-            self.y + 1.5,
-            self.x + self.width - 2.0,
-            self.y + self.height - 0.5,
+            left + 2.0 * scale,
+            self.y + 1.5 * scale,
+            left + self.visual_width - 2.0 * scale,
+            self.y + self.visual_height - 0.5 * scale,
         )
 
     def contains_point(self, px: float, py: float) -> bool:
@@ -370,56 +395,110 @@ class Ship:
         self.hp = max(0, self.hp - amount)
         self.hit_flash_timer = 0.22
         if self.hp <= 0:
+            self.sink_offset = 0.0
             self.state = ShipState.SINKING
 
     def reverse_direction(self, new_direction: int) -> None:
         """Inverte la rotta e rigenera l'orientamento specchiato dello sprite."""
         if new_direction != self.direction:
             self.direction = 1 if new_direction >= 0 else -1
+            self.three_quarter_timer = 1.0
             self._build_ascii_art()
 
-    def update(self, dt: float, sea: Sea, screen_width: int) -> None:
+    def update(
+        self,
+        dt: float,
+        sea: Sea,
+        screen_width: int,
+        other_ships: Tuple["Ship", ...] = (),
+        *,
+        icebreaker: bool = False,
+    ) -> None:
         """
-        Aggiorna movimento orizzontale, galleggiamento sul pelo dell'acqua,
-        cooldown di fuoco e discesa/inclinazione durante l'affondamento.
+        Aggiorna navigazione autonoma sulla superficie, combattimento e affondamento.
         """
         self.smoke_phase += dt * 4.2
+        self.icebreaker = icebreaker
+        self.max_visible_depth = max(
+            1.0,
+            float(sea.height - sea.base_sea_y - 2),
+        )
         if self.hit_flash_timer > 0.0:
             self.hit_flash_timer = max(0.0, self.hit_flash_timer - dt)
+        if self.three_quarter_timer > 0.0:
+            self.three_quarter_timer = max(0.0, self.three_quarter_timer - dt)
 
         if self.state == ShipState.SAILING:
-            slope = sea.wave_slope_at(self.center_x)
+            slope = sea.wave_slope_at(self.center_x, self.depth_offset)
             effective_speed = self.speed * (1.0 - 0.12 * slope * self.direction)
-            self.x += self.direction * effective_speed * dt
+            next_x = self.x + self.direction * effective_speed * dt
 
-            if self.direction > 0 and self.x > screen_width - self.width - 2:
+            if self.direction > 0 and next_x > screen_width - self.width - 2:
                 self.reverse_direction(-1)
-            elif self.direction < 0 and self.x < 2:
+                next_x = self.x + self.direction * effective_speed * dt
+            elif self.direction < 0 and next_x < 2:
                 self.reverse_direction(1)
+            for other in other_ships:
+                if other.ship_id == self.ship_id or other.state != ShipState.SAILING:
+                    continue
+                separation = (self.width + other.width) * 0.5 + 2.0
+                next_center = next_x + self.width * 0.5
+                current_center = self.center_x
+                next_distance = other.center_x - next_center
+                moving_toward = (other.center_x - current_center) * self.direction > 0
+                same_depth_lane = abs(self.depth_offset - other.depth_offset) < (
+                    self.height + other.height
+                ) * 0.35
+                if (
+                    abs(next_distance) < separation
+                    and moving_toward
+                    and same_depth_lane
+                ):
+                    self.reverse_direction(-self.direction)
+                    next_x = self.x + self.direction * effective_speed * dt
+                    if next_distance > 0:
+                        next_x = min(next_x, other.x - self.width - 2.0)
+                    else:
+                        next_x = max(next_x, other.x + other.width + 2.0)
 
-            waterline_y = sea.surface_y_at(self.center_x)
-            self.y = waterline_y - (self.height - 1.0)
+            self.x = max(2.0, min(float(screen_width - self.width - 2), next_x))
+
+            max_depth = self.max_visible_depth
+            self.depth_change_timer -= dt
+            if icebreaker:
+                self.depth_target = 0.0
+            elif self.depth_change_timer <= 0.0:
+                self.depth_target = random.uniform(0.0, max_depth)
+                self.depth_change_timer = random.uniform(3.0, 6.0)
+            self.depth_target = max(0.0, min(max_depth, self.depth_target))
+            depth_delta = self.depth_target - self.depth_offset
+            depth_step = self.depth_speed * dt
+            self.depth_offset += max(-depth_step, min(depth_step, depth_delta))
+
+            surface_y = sea.surface_y_at(self.center_x, self.depth_offset)
+            self.y = surface_y - self.visual_height
             self.fire_cooldown = max(0.0, self.fire_cooldown - dt)
 
         elif self.state == ShipState.SINKING:
-            self.x += self.direction * (self.speed * 0.20) * dt
             self.sink_offset += SHIP_SINK_SPEED * dt
-            waterline_y = sea.surface_y_at(self.center_x)
-            self.y = waterline_y - (self.height - 1.0) + self.sink_offset
+            waterline_y = sea.surface_y_at(self.center_x, self.depth_offset)
+            self.y = waterline_y - self.visual_height + self.sink_offset
 
-            if self.sink_offset >= self.height + 2.5:
+            if self.sink_offset >= self.visual_height:
                 self.state = ShipState.SUNK
 
         hp_ratio = self.hp / max(1, self.max_hp)
         if (hp_ratio < 0.5 or self.state == ShipState.SINKING) and self.state != ShipState.SUNK:
             from_stern = random.random() < 0.45
             emit_x = (
-                self.center_x - self.direction * (self.width * 0.26)
+                self.center_x - self.direction * (self.visual_width * 0.26)
                 if from_stern
                 else self.center_x + random.uniform(-1.2, 1.2)
             )
-            emit_y = self.y + (4.2 if from_stern else 2.2)
-            if emit_y < sea.surface_y_at(emit_x):
+            emit_y = self.y + (
+                (4.2 if from_stern else 2.2) * self.perspective_scale
+            )
+            if emit_y < sea.surface_y_at(emit_x, self.depth_offset):
                 self.hull_smoke.append(
                     HullSmokeParticle(
                         x=emit_x,
@@ -469,6 +548,8 @@ class Ship:
             "hull_day" if is_day else "hull_night",
             COLOR_SHIP_HULL_DAY if is_day else COLOR_SHIP_HULL,
         )
+        if self.icebreaker:
+            hull_base = lerp_rgb(hull_base, (160, 225, 245), 0.62)
         sail_col = self.palette.get(
             "sail_day" if is_day else "sail_night",
             COLOR_SHIP_SAIL_DAY if is_day else COLOR_SHIP_SAIL,
@@ -531,19 +612,20 @@ class Ship:
         """Disegna spruzzi bianchi dinamici ('*', '.', 'o') a prua e nella scia di poppa."""
         splash_glyphs = ("*", "o", ".", "~")
         phase_tick = int(self.smoke_phase * 2.2)
+        ship_width = self.visual_width
 
         if self.direction > 0:
-            bow_start = base_x + self.width - 6
+            bow_start = base_x + ship_width - 5
             bow_cols = (bow_start, bow_start + 1, bow_start + 2)
             stern_cols = (base_x - 2, base_x - 1, base_x, base_x + 1)
         else:
             bow_cols = (base_x + 3, base_x + 4, base_x + 5)
-            stern_start = base_x + self.width - 2
+            stern_start = base_x + ship_width - 2
             stern_cols = (stern_start, stern_start + 1, stern_start + 2, stern_start + 3)
 
         for i, sx in enumerate(bow_cols):
             if 0 <= sx < renderer.width:
-                wy = int(round(sea.surface_y_at(float(sx))))
+                wy = int(round(sea.surface_y_at(float(sx), self.depth_offset)))
                 glyph = splash_glyphs[(phase_tick + i) % len(splash_glyphs)]
                 renderer.draw_text(
                     glyph,
@@ -556,10 +638,37 @@ class Ship:
 
         for i, sx in enumerate(stern_cols):
             if 0 <= sx < renderer.width:
-                wy = int(round(sea.surface_y_at(float(sx))))
+                wy = int(round(sea.surface_y_at(float(sx), self.depth_offset)))
                 glyph = "o" if (phase_tick + i) % 3 == 0 else ("." if i % 2 == 0 else "*")
                 col = COLOR_SHIP_WAKE if i < 2 else COLOR_WAVE_FOAM
                 renderer.draw_text(glyph, sx, wy, col, bold=True, transparent=True)
+
+    def _scaled_sprite(
+        self, lines: List[str]
+    ) -> Tuple[List[str], List[int], List[int]]:
+        """Ridimensiona lo sprite preservando la riga del banner e la chiglia."""
+        output_rows = min(len(lines), self.visual_height)
+        output_cols = min(len(lines[0]), self.visual_width)
+        source_rows = [
+            min(len(lines) - 1, int(row * len(lines) / output_rows))
+            for row in range(output_rows)
+        ]
+
+        for required_row in (*self._banner_spans.keys(), len(lines) - 1):
+            if required_row not in source_rows:
+                target = min(
+                    range(output_rows),
+                    key=lambda idx: abs(source_rows[idx] - required_row),
+                )
+                source_rows[target] = required_row
+        source_rows.sort()
+
+        source_cols = [
+            min(len(lines[0]) - 1, int(col * len(lines[0]) / output_cols))
+            for col in range(output_cols)
+        ]
+        scaled = ["".join(lines[row][col] for col in source_cols) for row in source_rows]
+        return scaled, source_rows, source_cols
 
     def draw(self, renderer: Renderer, sea: Sea, *, is_day: bool = True) -> None:
         """
@@ -569,20 +678,60 @@ class Ship:
         if self.state == ShipState.SUNK:
             return
 
-        base_x = int(round(self.x))
+        base_x = int(round(self.visual_left))
         base_y = self.y
         hp_ratio = self.hp / max(1, self.max_hp)
+        source_lines = (
+            self._three_quarter_lines()
+            if self.three_quarter_timer > 0
+            else self._lines
+        )
+        lines, source_rows, source_cols = self._scaled_sprite(source_lines)
 
-        if self.state == ShipState.SINKING:
-            tilt_slope = min(0.32, self.sink_offset * 0.05) * self.sink_list_dir
-        else:
-            tilt_slope = sea.wave_slope_at(self.center_x) * 0.14
+        for row_idx, line in enumerate(lines):
+            source_row = source_rows[row_idx]
+            screen_y = int(
+                round(
+                    base_y
+                    + row_idx
+                    + (
+                        self.sink_offset
+                        if self.state == ShipState.SINKING
+                        else 0.0
+                    )
+                )
+            )
+            hull_start = self.spec.cartouche_row + 1
+            if source_row >= hull_start and screen_y < renderer.height:
+                occupied_cols = [
+                    col_idx for col_idx, char in enumerate(line) if char != " "
+                ]
+                if occupied_cols:
+                    for col_idx in range(min(occupied_cols), max(occupied_cols) + 1):
+                        if line[col_idx] != " ":
+                            continue
+                        screen_x = base_x + col_idx
+                        if not 0 <= screen_x < renderer.width:
+                            continue
+                        if (
+                            self.state == ShipState.SINKING
+                            and screen_y
+                            > round(sea.surface_y_at(float(screen_x), self.depth_offset))
+                        ):
+                            continue
+                        renderer.draw_text(
+                            " ",
+                            screen_x,
+                            screen_y,
+                            (0, 0, 0),
+                            transparent=False,
+                        )
 
-        for row_idx, line in enumerate(self._lines):
-            row_span = self._banner_spans.get(row_idx)
+            row_span = self._banner_spans.get(source_row)
             for col_idx, ch in enumerate(line):
+                source_col = source_cols[col_idx]
                 in_banner = (
-                    row_span is not None and row_span[0] <= col_idx < row_span[1]
+                    row_span is not None and row_span[0] <= source_col < row_span[1]
                 )
                 if ch == " " and not in_banner:
                     continue
@@ -591,30 +740,15 @@ class Ship:
                 if screen_x < 0 or screen_x >= renderer.width:
                     continue
 
-                rel_col = col_idx - (self.width * 0.5)
-                cell_y_float = base_y + row_idx + (rel_col * tilt_slope)
-                screen_y = int(round(cell_y_float))
-                local_water_y = int(round(sea.surface_y_at(float(screen_x))))
-
-                if self.state == ShipState.SINKING:
-                    if screen_y > local_water_y + 1:
-                        continue
-                    if screen_y == local_water_y + 1:
-                        base_col, _, _, _ = self._cell_style(
-                            row_idx, col_idx, ch, hp_ratio, is_day=is_day
-                        )
-                        fg_col = lerp_rgb(base_col, COLOR_SHIP_SUBMERGED, 0.65)
-                        bg_col = None
-                        bold = True
-                        trans = True
-                    else:
-                        fg_col, bg_col, bold, trans = self._cell_style(
-                            row_idx, col_idx, ch, hp_ratio, is_day=is_day
-                        )
-                else:
-                    fg_col, bg_col, bold, trans = self._cell_style(
-                        row_idx, col_idx, ch, hp_ratio, is_day=is_day
-                    )
+                if (
+                    self.state == ShipState.SINKING
+                    and screen_y
+                    > round(sea.surface_y_at(float(screen_x), self.depth_offset))
+                ):
+                    continue
+                fg_col, bg_col, bold, trans = self._cell_style(
+                    source_row, source_col, ch, hp_ratio, is_day=is_day
+                )
 
                 renderer.draw_text(
                     ch,
@@ -628,9 +762,26 @@ class Ship:
 
         if self.state == ShipState.SAILING:
             self._draw_waterline_splashes(renderer, sea, base_x)
+            if self.icebreaker:
+                bow_x = (
+                    base_x + self.visual_width - 2
+                    if self.direction > 0
+                    else base_x
+                )
+                ice_y = int(
+                    round(sea.surface_y_at(float(bow_x), self.depth_offset))
+                )
+                renderer.draw_text(
+                    ">>" if self.direction > 0 else "<<",
+                    bow_x - 1 if self.direction > 0 else bow_x,
+                    ice_y,
+                    (190, 245, 255),
+                    bold=True,
+                    transparent=True,
+                )
 
         if self.state == ShipState.SAILING and self.hp < self.max_hp:
-            bar_len = 6
+            bar_len = max(3, int(round(6 * self.perspective_scale)))
             filled = max(1, int(round(hp_ratio * bar_len)))
             hp_bar = ("▪" * filled) + ("·" * (bar_len - filled))
             hp_color = lerp_rgb((255, 70, 35), (80, 245, 100), hp_ratio)
@@ -643,7 +794,12 @@ class Ship:
         for sp in self.hull_smoke:
             sx = int(round(sp.x))
             sy = int(round(sp.y))
-            if 0 <= sx < renderer.width and 1 <= sy < int(round(sea.surface_y_at(float(sx)))):
+            if (
+                0 <= sx < renderer.width
+                and 1
+                <= sy
+                < int(round(sea.surface_y_at(float(sx), self.depth_offset)))
+            ):
                 life_t = sp.age / max(0.01, sp.ttl)
                 glyph = sp.char if life_t < 0.5 else ("*" if life_t < 0.8 else "°")
                 smoke_col = lerp_rgb(COLOR_HULL_SMOKE_DARK, COLOR_SMOKE, life_t)
@@ -655,3 +811,39 @@ class Ship:
                     bold=True,
                     transparent=True,
                 )
+
+    def _three_quarter_lines(self) -> List[str]:
+        """Stringe la nave e inclina lo scafo verso prua durante la virata."""
+        narrow_width = max(8, int(self.width * 0.72))
+        base_left = (self.width - narrow_width) // 2
+        result: List[str] = []
+        for row_idx, line in enumerate(self._lines):
+            if row_idx in self._banner_spans:
+                result.append(line)
+                continue
+
+            glyphs = list(line.rstrip())
+            while len(glyphs) > narrow_width:
+                space_indices = [
+                    idx for idx, char in enumerate(glyphs) if char == " "
+                ]
+                if not space_indices:
+                    break
+                idx = next(
+                    (
+                        candidate
+                        for candidate in space_indices
+                        if candidate > 0
+                        and candidate + 1 < len(glyphs)
+                        and glyphs[candidate - 1] == " "
+                    ),
+                    space_indices[0],
+                )
+                glyphs.pop(idx)
+            squeezed = "".join(glyphs)
+            shear = int(row_idx / max(1, self.height - 1) * 2)
+            start = base_left + shear * self.direction
+            start = max(0, min(self.width - len(squeezed), start))
+            result.append((" " * start + squeezed)[:self.width].ljust(self.width))
+
+        return result

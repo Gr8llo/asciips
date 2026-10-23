@@ -5,7 +5,7 @@ senza bloccare il main thread.
 """
 
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import threading
 import time
@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from config import (
+    AppearanceMode,
     DEFAULT_CITY,
     FORECAST_API_URL,
     GEOCODING_API_URL,
@@ -41,11 +42,15 @@ class WeatherSnapshot:
     time_of_day: TimeOfDay
     wmo_code: int
     temperature_c: Optional[float]
+    apparent_temperature_c: Optional[float]
+    relative_humidity_pct: Optional[float]
     wind_speed_kmh: float
     is_forced: bool
     is_time_forced: bool
+    appearance_mode: AppearanceMode
     status_note: str
     last_updated: float
+    city_local_time: Optional[datetime] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
@@ -78,10 +83,20 @@ class WeatherState:
         self._time_of_day: TimeOfDay = (
             forced_time if forced_time is not None else _default_time_of_day_from_clock()
         )
+        self._live_time_of_day: TimeOfDay = self._time_of_day
+        self._appearance_mode = (
+            AppearanceMode.LIGHT
+            if forced_time == TimeOfDay.DAY
+            else AppearanceMode.DARK
+            if forced_time == TimeOfDay.NIGHT
+            else AppearanceMode.AUTO
+        )
         self._wmo_code: int = self._default_wmo_for_condition(self._condition)
         self._live_wmo_code: int = self._wmo_code
         self._has_live_data: bool = False
         self._temperature_c: Optional[float] = None
+        self._apparent_temperature_c: Optional[float] = None
+        self._relative_humidity_pct: Optional[float] = None
         self._wind_speed_kmh: float = 10.0
         self._status_note: str = (
             f"FORCED ({self._condition.value.upper()})"
@@ -89,6 +104,8 @@ class WeatherState:
             else "In attesa di Open-Meteo..."
         )
         self._last_updated: float = 0.0
+        self._city_local_time: Optional[datetime] = None
+        self._city_time_monotonic: Optional[float] = None
         self._latitude: Optional[float] = None
         self._longitude: Optional[float] = None
 
@@ -96,33 +113,75 @@ class WeatherState:
     def _default_wmo_for_condition(condition: WeatherCondition) -> int:
         mapping = {
             WeatherCondition.CLEAR: 0,
+            WeatherCondition.PARTLY_CLOUDY: 1,
+            WeatherCondition.OVERCAST: 3,
             WeatherCondition.CLOUDY: 2,
+            WeatherCondition.DRIZZLE: 51,
             WeatherCondition.RAIN: 61,
+            WeatherCondition.RAIN_SHOWERS: 80,
             WeatherCondition.SNOW: 73,
-            WeatherCondition.STORM: 95,
+            WeatherCondition.SNOW_GRAINS: 77,
+            WeatherCondition.FOG: 45,
+            WeatherCondition.THUNDERSTORM: 95,
+            WeatherCondition.THUNDERSTORM_HAIL: 96,
         }
         return mapping.get(condition, 0)
 
+    def cycle_appearance_mode(self) -> AppearanceMode:
+        """Cicla tra automatico, tema chiaro e tema scuro."""
+        cycle_order = (
+            AppearanceMode.AUTO,
+            AppearanceMode.LIGHT,
+            AppearanceMode.DARK,
+        )
+        with self._lock:
+            idx = cycle_order.index(self._appearance_mode)
+            self._appearance_mode = cycle_order[(idx + 1) % len(cycle_order)]
+            if self._appearance_mode == AppearanceMode.AUTO:
+                self._forced_time = None
+                self._time_of_day = self._live_time_of_day
+            else:
+                self._time_of_day = (
+                    TimeOfDay.DAY
+                    if self._appearance_mode == AppearanceMode.LIGHT
+                    else TimeOfDay.NIGHT
+                )
+                self._forced_time = self._time_of_day
+            return self._appearance_mode
+
     def toggle_time_of_day(self) -> TimeOfDay:
-        """Inverte manualmente giorno/notte (tasto G/N a runtime) e blocca la scelta."""
+        """Compatibilita' per i chiamanti storici del toggle giorno/notte."""
         with self._lock:
             self._time_of_day = (
-                TimeOfDay.NIGHT if self._time_of_day == TimeOfDay.DAY else TimeOfDay.DAY
+                TimeOfDay.NIGHT
+                if self._time_of_day == TimeOfDay.DAY
+                else TimeOfDay.DAY
+            )
+            self._appearance_mode = (
+                AppearanceMode.DARK
+                if self._time_of_day == TimeOfDay.NIGHT
+                else AppearanceMode.LIGHT
             )
             self._forced_time = self._time_of_day
             return self._time_of_day
 
     def cycle_weather(self) -> Optional[WeatherCondition]:
         """
-        Cambia ciclicamente lo stato meteo forzato (tasto W):
-        CLEAR -> CLOUDY -> RAIN -> SNOW -> STORM -> Ritorno al meteo live API (None).
+        Cambia ciclicamente tutti i meteo forzati (tasto W), poi torna al meteo live.
         """
         cycle_order = [
             WeatherCondition.CLEAR,
+            WeatherCondition.PARTLY_CLOUDY,
+            WeatherCondition.OVERCAST,
             WeatherCondition.CLOUDY,
+            WeatherCondition.DRIZZLE,
             WeatherCondition.RAIN,
+            WeatherCondition.RAIN_SHOWERS,
             WeatherCondition.SNOW,
-            WeatherCondition.STORM,
+            WeatherCondition.SNOW_GRAINS,
+            WeatherCondition.FOG,
+            WeatherCondition.THUNDERSTORM,
+            WeatherCondition.THUNDERSTORM_HAIL,
             None,
         ]
         with self._lock:
@@ -142,7 +201,10 @@ class WeatherState:
                 self._status_note = f"FORCED ({next_forced.value.upper()})"
             else:
                 self._wmo_code = self._live_wmo_code
-                self._condition = map_wmo_to_condition(self._live_wmo_code)
+                self._condition = map_wmo_to_condition(
+                    self._live_wmo_code,
+                    is_day=self._live_time_of_day == TimeOfDay.DAY,
+                )
                 self._status_note = "LIVE" if self._has_live_data else "LIVE (API)"
             return self._forced_condition
 
@@ -153,6 +215,9 @@ class WeatherState:
         wmo_code: int,
         temperature_c: Optional[float],
         wind_speed_kmh: float,
+        apparent_temperature_c: Optional[float] = None,
+        relative_humidity_pct: Optional[float] = None,
+        city_local_time: Optional[datetime] = None,
         is_day: Optional[bool] = None,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
@@ -168,17 +233,24 @@ class WeatherState:
                 self._longitude = longitude
             self._live_wmo_code = wmo_code
             self._has_live_data = True
+            if is_day is not None:
+                self._live_time_of_day = TimeOfDay.DAY if is_day else TimeOfDay.NIGHT
             if self._forced_condition is None:
                 self._wmo_code = wmo_code
-                self._condition = map_wmo_to_condition(wmo_code)
+                self._condition = map_wmo_to_condition(wmo_code, is_day=is_day)
                 self._status_note = status_note
             else:
                 self._status_note = f"FORCED ({self._forced_condition.value.upper()})"
-            if self._forced_time is None and is_day is not None:
-                self._time_of_day = TimeOfDay.DAY if is_day else TimeOfDay.NIGHT
+            if self._appearance_mode == AppearanceMode.AUTO and is_day is not None:
+                self._time_of_day = self._live_time_of_day
             self._temperature_c = temperature_c
+            self._apparent_temperature_c = apparent_temperature_c
+            self._relative_humidity_pct = relative_humidity_pct
             self._wind_speed_kmh = wind_speed_kmh
             self._last_updated = time.time()
+            if city_local_time is not None:
+                self._city_local_time = city_local_time
+                self._city_time_monotonic = time.monotonic()
 
     def set_error(self, note: str) -> None:
         """Registra un errore di rete mantenendo l'ultimo meteo valido."""
@@ -194,11 +266,26 @@ class WeatherState:
                 time_of_day=self._time_of_day,
                 wmo_code=self._wmo_code,
                 temperature_c=self._temperature_c,
+                apparent_temperature_c=self._apparent_temperature_c,
+                relative_humidity_pct=self._relative_humidity_pct,
                 wind_speed_kmh=self._wind_speed_kmh,
                 is_forced=self._forced_condition is not None,
-                is_time_forced=self._forced_time is not None,
+                is_time_forced=self._appearance_mode != AppearanceMode.AUTO,
+                appearance_mode=self._appearance_mode,
                 status_note=self._status_note,
                 last_updated=self._last_updated,
+                city_local_time=(
+                    self._city_local_time
+                    + timedelta(
+                        seconds=max(
+                            0.0,
+                            time.monotonic() - self._city_time_monotonic,
+                        )
+                    )
+                    if self._city_local_time is not None
+                    and self._city_time_monotonic is not None
+                    else self._city_local_time
+                ),
                 latitude=self._latitude,
                 longitude=self._longitude,
             )
@@ -264,13 +351,13 @@ class WeatherPollerThread(threading.Thread):
 
     def _fetch_current_weather(
         self, lat: float, lon: float
-    ) -> Tuple[int, Optional[float], float, Optional[bool]]:
-        """Recupera codice WMO, temperatura (°C), vento (km/h) e flag is_day da Open-Meteo."""
+    ) -> Tuple[int, Optional[float], Optional[float], Optional[float], float, Optional[bool], Optional[datetime]]:
+        """Recupera condizioni correnti e orario locale da Open-Meteo."""
         params = urllib.parse.urlencode(
             {
                 "latitude": f"{lat:.4f}",
                 "longitude": f"{lon:.4f}",
-                "current": "temperature_2m,weather_code,wind_speed_10m,is_day",
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day",
                 "timezone": "auto",
             }
         )
@@ -282,31 +369,58 @@ class WeatherPollerThread(threading.Thread):
             cw = data["current_weather"]
             wmo_code = int(cw.get("weathercode", 0))
             temp = float(cw["temperature"]) if "temperature" in cw else None
+            apparent = float(cw["apparent_temperature"]) if cw.get("apparent_temperature") is not None else None
+            humidity = float(cw["relative_humidity_2m"]) if cw.get("relative_humidity_2m") is not None else None
             wind = float(cw.get("windspeed", 10.0))
             is_day_val = cw.get("is_day")
             is_day = bool(int(is_day_val)) if is_day_val is not None else None
-            return wmo_code, temp, wind, is_day
+            city_time = (
+                datetime.fromisoformat(str(cw["time"]))
+                if cw.get("time")
+                else None
+            )
+            return wmo_code, temp, apparent, humidity, wind, is_day, city_time
 
         wmo_code = int(current.get("weather_code", 0))
         temp_val = current.get("temperature_2m")
         temp = float(temp_val) if temp_val is not None else None
+        apparent_val = current.get("apparent_temperature")
+        apparent = float(apparent_val) if apparent_val is not None else None
+        humidity_val = current.get("relative_humidity_2m")
+        humidity = float(humidity_val) if humidity_val is not None else None
         wind = float(current.get("wind_speed_10m", 10.0))
         is_day_val = current.get("is_day")
         is_day = bool(int(is_day_val)) if is_day_val is not None else None
-        return wmo_code, temp, wind, is_day
+        city_time = (
+            datetime.fromisoformat(str(current["time"]))
+            if current.get("time")
+            else None
+        )
+        return wmo_code, temp, apparent, humidity, wind, is_day, city_time
 
     def fetch_once(self) -> None:
         """Esegue un singolo ciclo di geocodifica + recupero meteo."""
         try:
             lat, lon, resolved_city = self._geocode_city(self.city_query)
-            wmo_code, temp_c, wind_kmh, is_day = self._fetch_current_weather(lat, lon)
+            (
+                wmo_code,
+                temp_c,
+                apparent_temp_c,
+                humidity_pct,
+                wind_kmh,
+                is_day,
+                city_local_time,
+            ) = self._fetch_current_weather(lat, lon)
             snap = self.state.snapshot()
             note = f"FORCED ({snap.condition.value.upper()})" if snap.is_forced else "LIVE"
             self.state.update(
                 city=resolved_city,
                 wmo_code=wmo_code,
                 temperature_c=temp_c,
+                apparent_temperature_c=apparent_temp_c,
+                relative_humidity_pct=humidity_pct,
                 wind_speed_kmh=wind_kmh,
+                city_local_time=city_local_time,
                 is_day=is_day,
                 latitude=lat,
                 longitude=lon,
