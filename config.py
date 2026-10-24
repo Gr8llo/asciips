@@ -6,11 +6,30 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Percorsi di base
 BASE_DIR: Path = Path(__file__).resolve().parent
 PHRASES_FILE: Path = BASE_DIR / "phrases.json"
+
+# Dizionario interno di fallback (usato se phrases.json manca, è illeggibile o corrotto)
+FALLBACK_PHRASES: Dict[str, List[str]] = {
+    "sail_banners": [
+        "AUDACES IUVAT",
+        "BLACK PEARL",
+        "BOLOGNA",
+        "VENTO IN POPPA",
+        "FLYING DUTCHMAN",
+    ],
+    "cannon_insults": [
+        "FUOCO!",
+        "A FONDO!",
+        "BOOM!",
+        "MISERABILE!",
+        "PRENDI QUESTA!",
+    ],
+}
+DEFAULT_PHRASES: Dict[str, List[str]] = FALLBACK_PHRASES
 
 # Parametri di default CLI e runtime
 DEFAULT_CITY: str = "Bologna"
@@ -20,7 +39,7 @@ FPS_STEP: int = 5
 DEFAULT_FPS: int = MIN_FPS
 DEFAULT_MAX_SHIPS: int = 3
 WEATHER_POLL_INTERVAL_SEC: int = 600  # 10 minuti (600 secondi)
-HTTP_TIMEOUT_SEC: int = 8
+HTTP_TIMEOUT_SEC: int = 4             # Timeout HTTP rigoroso (3-5 secondi)
 
 # Endpoint API Open-Meteo (nessun token richiesto)
 GEOCODING_API_URL: str = "https://geocoding-api.open-meteo.com/v1/search"
@@ -57,18 +76,34 @@ class AppearanceMode(str, Enum):
     DARK = "dark"
 
 
-RAIN_CONDITIONS = {
+class HudMode(str, Enum):
+    """Modalita' di visualizzazione dell'HUD superiore (Auto, Big HUD, Compatto)."""
+    AUTO = "auto"
+    BIG = "big"
+    COMPACT = "compact"
+
+
+BIG_HUD_MIN_WIDTH: int = 100
+BIG_HUD_MIN_HEIGHT: int = 30
+
+
+RAIN_CONDITIONS: Set[WeatherCondition] = {
     WeatherCondition.DRIZZLE,
     WeatherCondition.RAIN,
     WeatherCondition.RAIN_SHOWERS,
 }
-SNOW_CONDITIONS = {WeatherCondition.SNOW, WeatherCondition.SNOW_GRAINS}
-THUNDERSTORM_CONDITIONS = {
+SNOW_CONDITIONS: Set[WeatherCondition] = {
+    WeatherCondition.SNOW,
+    WeatherCondition.SNOW_GRAINS,
+}
+THUNDERSTORM_CONDITIONS: Set[WeatherCondition] = {
     WeatherCondition.THUNDERSTORM,
     WeatherCondition.THUNDERSTORM_HAIL,
 }
-PRECIPITATION_CONDITIONS = RAIN_CONDITIONS | SNOW_CONDITIONS | THUNDERSTORM_CONDITIONS
-CLOUD_CONDITIONS = {
+PRECIPITATION_CONDITIONS: Set[WeatherCondition] = (
+    RAIN_CONDITIONS | SNOW_CONDITIONS | THUNDERSTORM_CONDITIONS
+)
+CLOUD_CONDITIONS: Set[WeatherCondition] = {
     WeatherCondition.PARTLY_CLOUDY,
     WeatherCondition.OVERCAST,
     WeatherCondition.CLOUDY,
@@ -78,7 +113,7 @@ CLOUD_CONDITIONS = {
 
 # Mappatura codici WMO (World Meteorological Organization) secondo PRD
 def map_wmo_to_condition(
-    wmo_code: int, *, is_day: bool | None = None
+    wmo_code: int, *, is_day: Optional[bool] = None
 ) -> WeatherCondition:
     """Converte un codice meteo WMO nella corrispondente condizione di gioco."""
     if wmo_code == 0:
@@ -302,10 +337,10 @@ SHIP_MAX_SPEED: float = 2.3       # Celle al secondo
 SHIP_MAX_HP: int = 100
 CANNON_DAMAGE_MIN: int = 25
 CANNON_DAMAGE_MAX: int = 40
-SHIP_FIRE_RANGE_MIN: float = 14.0
-SHIP_FIRE_RANGE_MAX: float = 72.0
-SHIP_FIRE_COOLDOWN_MIN: float = 4.4
-SHIP_FIRE_COOLDOWN_MAX: float = 9.6
+SHIP_FIRE_RANGE_MIN: float = 4.0
+SHIP_FIRE_RANGE_MAX: float = 85.0
+SHIP_FIRE_COOLDOWN_MIN: float = 4.0
+SHIP_FIRE_COOLDOWN_MAX: float = 8.0
 SHIP_SINK_SPEED: float = 1.8      # Celle al secondo verso il fondo durante SINKING
 SHIP_RESPAWN_DELAY_MIN: float = 10.5
 SHIP_RESPAWN_DELAY_MAX: float = 15.5

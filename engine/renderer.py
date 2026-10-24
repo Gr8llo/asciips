@@ -17,6 +17,7 @@ from config import (
     SKY_GRADIENTS,
     WeatherCondition,
 )
+from engine.big_font import BIG_FONT, BIG_FONT_5X, BIG_HUD_GOLD, render_big_text
 
 
 def clamp_byte(value: float) -> int:
@@ -199,12 +200,24 @@ class Renderer:
         transparent: bool = True,
     ) -> None:
         """
-        Disegna una stringa alle coordinate (x, y) in Foreground su sfondo trasparente.
+        Disegna una stringa alle coordinate (x, y) con clipping orizzontale e verticale
+        anti-crash per evitare qualsiasi scrittura fuori dai bordi dello schermo.
         """
+        if self.width <= 0 or self.height <= 0:
+            return
         if y < 0 or y >= self.height or not text:
             return
 
-        if x >= self.width or x + len(text) <= 0:
+        if x < 0:
+            text = text[-x:]
+            x = 0
+        if x >= self.width or not text:
+            return
+
+        max_len = self.width - x
+        if len(text) > max_len:
+            text = text[:max_len]
+        if not text:
             return
 
         if self.flash_intensity > 0.05:
@@ -248,3 +261,31 @@ class Renderer:
                 bold=bold,
                 transparent=transparent,
             )
+
+    def draw_big_text(
+        self,
+        text: str,
+        x: int,
+        y: int,
+        fg_rgb: RGB = BIG_HUD_GOLD,
+        *,
+        bg_rgb: Optional[RGB] = None,
+        bold: bool = True,
+        transparent: bool = True,
+    ) -> int:
+        """
+        Disegna una stringa con i caratteri giganti su 5 righe (BIG_FONT_5X) a partire da (x, y).
+        Restituisce la larghezza in colonne del blocco disegnato.
+        """
+        rows = render_big_text(text)
+        for row_offset, line in enumerate(rows):
+            self.draw_text(
+                line,
+                x,
+                y + row_offset,
+                fg_rgb,
+                bg_rgb=bg_rgb,
+                bold=bold,
+                transparent=transparent,
+            )
+        return len(rows[0]) if rows else 0

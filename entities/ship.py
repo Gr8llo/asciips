@@ -187,6 +187,7 @@ class HullSmokeParticle:
     char: str
     age: float = 0.0
     ttl: float = 1.4
+    max_ttl: float = 1.4
 
 
 class Ship:
@@ -247,7 +248,6 @@ class Ship:
             SHIP_FIRE_COOLDOWN_MIN * 0.6, SHIP_FIRE_COOLDOWN_MAX
         )
         self.sink_offset: float = 0.0
-        self.sink_list_dir: int = random.choice([-1, 1])
         self.hit_flash_timer: float = 0.0
         self.smoke_phase: float = random.uniform(0.0, math.tau)
         self.hull_smoke: List[HullSmokeParticle] = []
@@ -292,15 +292,15 @@ class Ship:
         if avail <= 0 or not text:
             return
 
-        clipped = text[:avail]
-        pad_left = (avail - len(clipped)) // 2
-        col_start = span_start + pad_left
-        col_end = col_start + len(clipped)
+        banner = text[:avail]
+        pad_left = (avail - len(banner)) // 2
+        start = span_start + pad_left
+        col_end = start + len(banner)
 
-        new_line = line[:col_start] + clipped + line[col_end:]
-        assert len(new_line) == expected_len
+        new_line = line[:start] + banner + line[start + len(banner):]
+        new_line = new_line[:expected_len].ljust(expected_len)
         self._lines[row_idx] = new_line
-        self._banner_spans[row_idx] = (col_start, col_end)
+        self._banner_spans[row_idx] = (start, col_end)
 
     def _build_ascii_art(self) -> None:
         """
@@ -370,23 +370,29 @@ class Ship:
         cannon_x = self.center_x + (self.direction * 4.5 * self.perspective_scale)
         return cannon_x, deck_y
 
+    @property
+    def sink_progress(self) -> float:
+        """Restituisce l'avanzamento verticale dell'affondamento in righe."""
+        return self.sink_offset
+
+    @sink_progress.setter
+    def sink_progress(self, value: float) -> None:
+        self.sink_offset = max(0.0, float(value))
+
     def hitbox(self) -> Tuple[float, float, float, float]:
-        """Rettangolo di collisione calibrato sulla sagoma reale del veliero."""
-        left = self.visual_left
-        scale = self.perspective_scale
-        return (
-            left + 2.0 * scale,
-            self.y + 1.5 * scale,
-            left + self.visual_width - 2.0 * scale,
-            self.y + self.visual_height - 0.5 * scale,
-        )
+        """Restituisce l'estensione rettangolare (x0, y0, x1, y1) dello scafo della nave."""
+        x0 = self.x + 1.5
+        y0 = self.y + 1.0
+        x1 = self.x + self.width - 1.5
+        y1 = self.y + self.height
+        return (x0, y0, x1, y1)
 
     def contains_point(self, px: float, py: float) -> bool:
         """Verifica se un proiettile in (px, py) ha colpito la nave."""
         if self.state != ShipState.SAILING:
             return False
-        left, top, right, bottom = self.hitbox()
-        return left <= px <= right and top <= py <= bottom
+        x0, y0, x1, y1 = self.hitbox()
+        return x0 <= px <= x1 and y0 <= py <= y1
 
     def take_damage(self, amount: int) -> None:
         """Applica danni allo scafo e avvia lo stato SINKING se gli HP scendono a 0."""
@@ -438,6 +444,7 @@ class Ship:
                 next_x = self.x + self.direction * effective_speed * dt
             elif self.direction < 0 and next_x < 2:
                 self.reverse_direction(1)
+                next_x = self.x + self.direction * effective_speed * dt
             for other in other_ships:
                 if other.ship_id == self.ship_id or other.state != ShipState.SAILING:
                     continue
@@ -484,7 +491,7 @@ class Ship:
             waterline_y = sea.surface_y_at(self.center_x, self.depth_offset)
             self.y = waterline_y - self.visual_height + self.sink_offset
 
-            if self.sink_offset >= self.visual_height:
+            if self.sink_offset >= min(9.0, float(self.visual_height)):
                 self.state = ShipState.SUNK
 
         hp_ratio = self.hp / max(1, self.max_hp)
@@ -499,6 +506,7 @@ class Ship:
                 (4.2 if from_stern else 2.2) * self.perspective_scale
             )
             if emit_y < sea.surface_y_at(emit_x, self.depth_offset):
+                particle_ttl = random.uniform(0.85, 1.65)
                 self.hull_smoke.append(
                     HullSmokeParticle(
                         x=emit_x,
@@ -507,18 +515,23 @@ class Ship:
                         vy=random.uniform(-4.6, -2.4),
                         char=random.choice(("*", "@", "o")),
                         age=0.0,
-                        ttl=random.uniform(0.85, 1.65),
+                        ttl=particle_ttl,
+                        max_ttl=particle_ttl,
                     )
                 )
 
-        alive_smoke: List[HullSmokeParticle] = []
         for sp in self.hull_smoke:
             sp.age += dt
+            sp.ttl -= dt
             sp.x += sp.vx * dt
             sp.y += sp.vy * dt
-            if sp.age < sp.ttl and sp.y >= 1.0:
-                alive_smoke.append(sp)
-        self.hull_smoke = alive_smoke[-28:]
+        self.hull_smoke = [
+            sp
+            for sp in self.hull_smoke
+            if sp.ttl > 0.0
+            and sp.y >= 1.0
+            and -50.0 <= sp.x <= screen_width + 50.0
+        ][-28:]
 
     def _is_stern_or_bow_wood_on_row4(self, col_idx: int) -> bool:
         """Identifica il castello di poppa ('___') o il bompresso ('/^') sulla riga 4."""
@@ -800,7 +813,7 @@ class Ship:
                 <= sy
                 < int(round(sea.surface_y_at(float(sx), self.depth_offset)))
             ):
-                life_t = sp.age / max(0.01, sp.ttl)
+                life_t = min(1.0, sp.age / max(0.01, sp.max_ttl))
                 glyph = sp.char if life_t < 0.5 else ("*" if life_t < 0.8 else "°")
                 smoke_col = lerp_rgb(COLOR_HULL_SMOKE_DARK, COLOR_SMOKE, life_t)
                 renderer.draw_text(

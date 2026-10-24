@@ -5,20 +5,25 @@ e Menù modale in sovraimpressione ([M] / [Esc]).
 """
 
 from __future__ import annotations
+from datetime import datetime
 import json
+import math
+from pathlib import Path
 import random
 import time
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+from asciimatics.event import KeyboardEvent
 from asciimatics.screen import Screen
 
 from config import (
     AppearanceMode,
-    COLOR_EXPLOSION,
-    COLOR_HUD_TEXT,
+    BIG_HUD_MIN_HEIGHT,
+    BIG_HUD_MIN_WIDTH,
     COLOR_WAVE_CREST,
     DEFAULT_FPS,
+    FALLBACK_PHRASES,
     FPS_STEP,
+    HudMode,
     MAX_FPS,
     MIN_FPS,
     PHRASES_FILE,
@@ -32,6 +37,7 @@ from config import (
     SHIP_RESPAWN_DELAY_MIN,
     SNOW_CONDITIONS,
 )
+from engine.big_font import BIG_FONT_5X, BIG_HUD_GOLD, render_big_text
 from engine.renderer import Renderer
 from engine.weather_thread import WeatherSnapshot, WeatherState
 from entities.projectile import (
@@ -54,28 +60,31 @@ COLOR_MENU_KEY: RGB = (120, 220, 255)
 
 
 def load_phrases(path: Path = PHRASES_FILE) -> Tuple[List[str], List[str]]:
-    """Carica le liste sail_banners e cannon_insults dal file JSON."""
-    default_banners = [
-        "AUDACES IUVAT",
-        "BLACK PEARL",
-        "BOLOGNA",
-        "VENTO IN POPPA",
-        "FLYING DUTCHMAN",
-    ]
-    default_insults = [
-        "FUOCO!",
-        "A FONDO!",
-        "BOOM!",
-        "MISERABILE!",
-        "PRENDI QUESTA!",
-    ]
+    """
+    Carica le liste sail_banners e cannon_insults dal file JSON.
+    In caso di file mancante, illeggibile o JSON corrotto, usa FALLBACK_PHRASES.
+    """
+    default_banners = list(FALLBACK_PHRASES["sail_banners"])
+    default_insults = list(FALLBACK_PHRASES["cannon_insults"])
     try:
         with path.open("r", encoding="utf-8") as f:
             data: Dict[str, List[str]] = json.load(f)
-        banners = [str(s).strip() for s in data.get("sail_banners", []) if str(s).strip()]
-        insults = [str(s).strip() for s in data.get("cannon_insults", []) if str(s).strip()]
+        if not isinstance(data, dict):
+            return default_banners, default_insults
+        raw_banners = data.get("sail_banners", [])
+        raw_insults = data.get("cannon_insults", [])
+        banners = (
+            [str(s).strip() for s in raw_banners if str(s).strip()]
+            if isinstance(raw_banners, list)
+            else []
+        )
+        insults = (
+            [str(s).strip() for s in raw_insults if str(s).strip()]
+            if isinstance(raw_insults, list)
+            else []
+        )
         return (banners or default_banners, insults or default_insults)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return default_banners, default_insults
 
 
@@ -90,11 +99,11 @@ def _format_duration(seconds: float) -> str:
 
 
 def _weather_hud_lines(snap: WeatherSnapshot) -> Tuple[str, ...]:
-    """Prepara titolo e letture meteo per l'intestazione multiriga."""
+    """Prepara le righe informative meteo per l'intestazione."""
     local_clock = (
         snap.city_local_time.strftime("%H:%M:%S")
         if snap.city_local_time is not None
-        else "N/D"
+        else datetime.now().strftime("%H:%M:%S")
     )
     temperature = (
         f"{snap.temperature_c:.1f}°C"
@@ -122,15 +131,40 @@ def _weather_hud_lines(snap: WeatherSnapshot) -> Tuple[str, ...]:
         ),
         (
             f"Umidita' {humidity} | Vento {snap.wind_speed_kmh:.0f} km/h | "
-            "[W] Meteo [T] Tema [M] Menu'"
+            "[W] Meteo [H] HUD [T] Tema [M] Menu'"
         ),
+    )
+
+
+def _compact_top_bar_line(snap: WeatherSnapshot) -> str:
+    """Formatta la Top Bar compatta a riga singola per finestre con height < 30."""
+    local_clock = (
+        snap.city_local_time.strftime("%H:%M:%S")
+        if snap.city_local_time is not None
+        else datetime.now().strftime("%H:%M:%S")
+    )
+    temperature = (
+        f"{snap.temperature_c:.1f}°C"
+        if snap.temperature_c is not None
+        else "N/D"
+    )
+    humidity = (
+        f"{snap.relative_humidity_pct:.0f}%"
+        if snap.relative_humidity_pct is not None
+        else "N/D"
+    )
+    mode = "DAY" if snap.is_day else "NIGHT"
+    return (
+        f" {snap.city} | {local_clock} | {snap.condition.value.upper()} "
+        f"| {temperature} | Umid {humidity} | Vento {snap.wind_speed_kmh:.0f}km/h "
+        f"| {mode} | [Spazio] Fuoco [W] Meteo [H] HUD [M] Menu"
     )
 
 
 class NavalBattleWorld:
     """
     Coordina tutte le entità della simulazione (meteo, mare, navi, proiettili),
-    le statistiche di sessione e il menù modale in sovraimpressione ([M]).
+    le statistiche di sessione, il Big HUD responsive ([H]) e il menù modale ([M]).
     """
 
     def __init__(
@@ -149,6 +183,7 @@ class NavalBattleWorld:
         self.current_fps: float = float(self.target_fps)
         self.session_start_time: float = time.monotonic()
         self.menu_open: bool = False
+        self.hud_mode: HudMode = HudMode.AUTO
 
         self.sail_banners, self.cannon_insults = load_phrases()
         self.sea = Sea(width, height)
@@ -173,6 +208,26 @@ class NavalBattleWorld:
         """Apre o chiude il menù modale in sovraimpressione ([M])."""
         self.menu_open = not self.menu_open
         return self.menu_open
+
+    def cycle_hud_mode(self) -> HudMode:
+        """Cicla manualmente la modalità dell'HUD tra AUTO, BIG e COMPACT ([H])."""
+        cycle = (HudMode.AUTO, HudMode.BIG, HudMode.COMPACT)
+        idx = cycle.index(self.hud_mode)
+        self.hud_mode = cycle[(idx + 1) % len(cycle)]
+        return self.hud_mode
+
+    def is_big_hud_active(self) -> bool:
+        """
+        Determina se disegnare il Big HUD a cifre giganti su 3 righe:
+        - Se HudMode.BIG: sempre attivo.
+        - Se HudMode.COMPACT: sempre disattivo (usa la Top Bar compatta).
+        - Se HudMode.AUTO: attivo se screen.height >= 30 e screen.width >= 100.
+        """
+        if self.hud_mode == HudMode.BIG:
+            return True
+        if self.hud_mode == HudMode.COMPACT:
+            return False
+        return self.height >= BIG_HUD_MIN_HEIGHT and self.width >= BIG_HUD_MIN_WIDTH
 
     def resize(self, width: int, height: int) -> None:
         """Adatta il mondo di gioco alle nuove dimensioni del terminale."""
@@ -242,7 +297,7 @@ class NavalBattleWorld:
 
     def adjust_max_ships(self, delta: int) -> int:
         """Aumenta o diminuisce a runtime il limite massimo di navi a schermo ([+] / [-])."""
-        new_max = max(2, min(10, self.max_ships + delta))
+        new_max = max(1, min(10, self.max_ships + delta))
         if new_max == self.max_ships:
             return self.max_ships
 
@@ -275,13 +330,28 @@ class NavalBattleWorld:
             return True
         return False
 
-    def _fire_from_ship(self, attacker: Ship, target: Ship) -> None:
-        """Lancia una frase-proiettile da `attacker` a `target` generando lo sbuffo di fumo."""
+    def _fire_from_ship(
+        self, attacker: Ship, target: Optional[Ship] = None
+    ) -> Projectile:
+        """
+        Lancia una frase-proiettile da `attacker` verso `target` (oppure in avanti
+        a scopo dimostrativo se `target` è None) generando lo sbuffo di fumo.
+        """
         start_x, start_y = attacker.cannon_origin
-        target_x = target.center_x
-        target_y = target.y + target.height * 0.55
-        insult = random.choice(self.cannon_insults)
+        if target is not None:
+            target_x = target.center_x
+            target_y = target.y + target.height * 0.55
+            water_depth = max(attacker.depth_offset, target.depth_offset)
+        else:
+            reach = min(38.0, max(18.0, self.width * 0.35))
+            raw_tx = attacker.center_x + attacker.direction * reach
+            target_x = max(4.0, min(float(max(10, self.width - 4)), raw_tx))
+            if abs(target_x - start_x) < 10.0:
+                target_x = start_x - attacker.direction * reach
+            water_depth = attacker.depth_offset
+            target_y = self.sea.surface_y_at(target_x, water_depth)
 
+        insult = random.choice(self.cannon_insults)
         proj = Projectile.launch_towards(
             owner_id=attacker.ship_id,
             start_x=start_x,
@@ -289,6 +359,7 @@ class NavalBattleWorld:
             target_x=target_x,
             target_y=target_y,
             text=insult,
+            water_depth=water_depth,
         )
         self.projectiles.append(proj)
         self.shots_fired_counter += 1
@@ -298,18 +369,30 @@ class NavalBattleWorld:
         attacker.fire_cooldown = random.uniform(
             SHIP_FIRE_COOLDOWN_MIN, SHIP_FIRE_COOLDOWN_MAX
         )
+        return proj
 
-    def force_salvo(self) -> None:
-        """Forza una salva di cannonate immediata tra tutte le navi ingaggiabili ([Spazio])."""
+    def force_salvo(self) -> int:
+        """
+        Forza una salva di cannonate immediata ([Spazio]):
+        - Se ci sono >= 2 navi in stato SAILING, ognuna spara alla nave avversaria più vicina.
+        - Se c'è 1 sola nave in stato SAILING, spara un colpo dimostrativo in avanti.
+        """
         sailing_ships = [s for s in self.ships if s.state == ShipState.SAILING]
-        if len(sailing_ships) < 2:
-            return
+        if not sailing_ships:
+            return 0
 
+        if len(sailing_ships) == 1:
+            self._fire_from_ship(sailing_ships[0], None)
+            return 1
+
+        fired = 0
         for attacker in sailing_ships:
             others = [t for t in sailing_ships if t.ship_id != attacker.ship_id]
             if others:
                 target = min(others, key=lambda t: abs(t.center_x - attacker.center_x))
                 self._fire_from_ship(attacker, target)
+                fired += 1
+        return fired
 
     def _handle_combat(self) -> None:
         """Verifica se le navi attive hanno un bersaglio a tiro e lancia le frasi-proiettile."""
@@ -317,6 +400,7 @@ class NavalBattleWorld:
         if len(sailing_ships) < 2:
             return
 
+        max_range = max(SHIP_FIRE_RANGE_MAX, self.width * 0.85)
         for attacker in sailing_ships:
             if attacker.fire_cooldown > 0.0:
                 continue
@@ -326,51 +410,68 @@ class NavalBattleWorld:
                 if target.ship_id == attacker.ship_id:
                     continue
                 dist = abs(target.center_x - attacker.center_x)
-                if SHIP_FIRE_RANGE_MIN <= dist <= max(SHIP_FIRE_RANGE_MAX, self.width * 0.65):
+                if SHIP_FIRE_RANGE_MIN <= dist <= max_range:
                     candidates.append(target)
 
             if candidates:
-                target = random.choice(candidates)
+                target = min(
+                    candidates, key=lambda t: abs(t.center_x - attacker.center_x)
+                )
                 self._fire_from_ship(attacker, target)
 
     def _update_projectiles(self, dt: float) -> None:
-        """Aggiorna la traiettoria dei proiettili e verifica impatti con navi o mare."""
+        """
+        Aggiorna la traiettoria dei proiettili con sub-stepping per evitare tunneling
+        a bassi FPS e verifica impatti con lo scafo avversario o con il mare.
+        """
+        steps = max(1, int(math.ceil(dt / 0.04)))
+        sub_dt = dt / steps
+
         for proj in self.projectiles:
             if not proj.active:
                 continue
-            proj.update(dt)
-            px, py = proj.x, proj.y
 
-            if px < -10 or px > self.width + 10:
-                proj.active = False
-                continue
+            for _ in range(steps):
+                if not proj.active:
+                    break
+                proj.update(sub_dt)
+                px, py = proj.x, proj.y
 
-            hit_ship = None
-            for ship in self.ships:
-                if ship.ship_id != proj.owner_id and ship.contains_point(px, py):
-                    hit_ship = ship
+                if px < -10.0 or px > self.width + 10.0 or py > self.height + 20.0:
+                    proj.active = False
                     break
 
-            if hit_ship is not None:
-                was_sailing = hit_ship.state == ShipState.SAILING
-                hit_ship.take_damage(proj.damage)
-                if was_sailing and hit_ship.state == ShipState.SINKING:
-                    self.sunk_counter += 1
-                proj.active = False
-                self.impacts.append(
-                    ImpactEffect(x=px, y=py, is_hit=True, text="BOOM!")
-                )
-                self.combat_particles.extend(spawn_impact_explosion(px, py))
-                continue
+                hit_ship: Optional[Ship] = None
+                for ship in self.ships:
+                    if ship.ship_id != proj.owner_id and ship.contains_point(px, py):
+                        hit_ship = ship
+                        break
 
-            water_y = self.sea.surface_y_at(px)
-            if py >= water_y:
-                proj.active = False
-                self.impacts.append(
-                    ImpactEffect(x=px, y=water_y, is_hit=False, text="~SPLASH~")
-                )
+                if hit_ship is not None:
+                    was_sailing = hit_ship.state == ShipState.SAILING
+                    hit_ship.take_damage(proj.damage)
+                    if was_sailing and hit_ship.state == ShipState.SINKING:
+                        self.sunk_counter += 1
+                    proj.active = False
+                    self.impacts.append(
+                        ImpactEffect(x=px, y=py, is_hit=True, text="BOOM!")
+                    )
+                    self.combat_particles.extend(spawn_impact_explosion(px, py))
+                    break
 
-        self.projectiles = [p for p in self.projectiles if p.active]
+                water_y = self.sea.surface_y_at(px, proj.water_depth)
+                if proj.is_descending and py >= water_y:
+                    proj.active = False
+                    self.impacts.append(
+                        ImpactEffect(x=px, y=water_y, is_hit=False, text="~SPLASH~")
+                    )
+                    break
+
+        self.projectiles = [
+            p
+            for p in self.projectiles
+            if p.active and -50.0 <= p.x <= self.width + 50.0
+        ]
 
     def update(self, dt: float) -> None:
         """Esegue un passo di simulazione completo (sospeso quando il menù è aperto)."""
@@ -404,7 +505,8 @@ class NavalBattleWorld:
                 tuple(other for other in self.ships if other is not ship),
                 icebreaker=condition in SNOW_CONDITIONS,
             )
-            if ship.state == ShipState.SUNK:
+            offscreen = ship.x < -50.0 or ship.x > self.width + 50.0
+            if ship.state == ShipState.SUNK or offscreen:
                 self.respawn_timers.append(
                     random.uniform(SHIP_RESPAWN_DELAY_MIN, SHIP_RESPAWN_DELAY_MAX)
                 )
@@ -434,11 +536,73 @@ class NavalBattleWorld:
         # 5. Aggiorna particelle di combattimento ed effetti di impatto
         for cp in self.combat_particles:
             cp.update(dt)
-        self.combat_particles = [cp for cp in self.combat_particles if cp.active]
+        self.combat_particles = [
+            cp
+            for cp in self.combat_particles
+            if cp.active and -50.0 <= cp.x <= self.width + 50.0
+        ]
 
         for imp in self.impacts:
             imp.timer -= dt
-        self.impacts = [imp for imp in self.impacts if imp.timer > 0.0]
+        self.impacts = [
+            imp
+            for imp in self.impacts
+            if imp.timer > 0.0 and -50.0 <= imp.x <= self.width + 50.0
+        ]
+
+    def _draw_hud(self, renderer: Renderer, snap: WeatherSnapshot) -> None:
+        """
+        Disegna l'HUD superiore con logica responsive e toggle manuale ([H]):
+        - Se il Big HUD è attivo (AUTO con height >= 30 e width >= 100, oppure HudMode.BIG):
+          disegna la barra informativa compatta in riga 0 e il Big Clock [HH:MM:SS] + [XX°C]
+          su 5 righe (BIG_FONT_5X) in colore oro brillante BOLD rgb(255, 215, 0) centrato in alto.
+        - Se la finestra è compatta (height < 30 o HudMode.COMPACT):
+          usa la Top Bar compatta a riga singola.
+        """
+        if self.width <= 0 or self.height <= 0:
+            return
+
+        top_bar = _compact_top_bar_line(snap)[: self.width].ljust(self.width)
+        renderer.draw_text(
+            top_bar,
+            0,
+            0,
+            COLOR_MENU_TEXT,
+            bg_rgb=COLOR_MENU_BG,
+            bold=True,
+            transparent=False,
+        )
+
+        if not self.is_big_hud_active() or self.height < 6:
+            return
+
+        clock_str = (
+            snap.city_local_time.strftime("%H:%M:%S")
+            if snap.city_local_time is not None
+            else datetime.now().strftime("%H:%M:%S")
+        )
+        temp_str = (
+            f"{int(round(snap.temperature_c))}°C"
+            if snap.temperature_c is not None
+            else "--°C"
+        )
+        big_label = f"{clock_str}   {temp_str}"
+        big_rows = render_big_text(big_label)
+        block_w = len(big_rows[0]) if big_rows else 0
+        start_x = max(0, (self.width - block_w) // 2)
+
+        for idx, row_text in enumerate(big_rows):
+            ry = 1 + idx
+            if ry >= self.height:
+                break
+            renderer.draw_text(
+                row_text,
+                start_x,
+                ry,
+                BIG_HUD_GOLD,
+                bold=True,
+                transparent=True,
+            )
 
     def _draw_menu_overlay(self, renderer: Renderer, snap: WeatherSnapshot) -> None:
         """
@@ -446,6 +610,9 @@ class NavalBattleWorld:
         - Sezione 1: Statistiche di Sessione
         - Sezione 2: Legenda Tasti Rapidi
         """
+        if self.width < 12 or self.height < 4:
+            return
+
         temp_str = (
             f"{snap.temperature_c:.1f}°C" if snap.temperature_c is not None else "N/D"
         )
@@ -460,9 +627,10 @@ class NavalBattleWorld:
             coords_str = f"[{snap.status_note}]"
         tod_label = "GIORNO" if snap.is_day else "NOTTE"
         session_time = _format_duration(time.monotonic() - self.session_start_time)
+        hud_label = f"{self.hud_mode.value.upper()} ({'BIG' if self.is_big_hud_active() else 'COMPACT'})"
 
-        box_w = min(max(52, self.width - 6), 66)
-        inner_w = box_w - 2
+        box_w = max(10, min(max(52, self.width - 6), 66, self.width))
+        inner_w = max(1, box_w - 2)
 
         def _pad_row(content: str) -> str:
             clipped = content[:inner_w]
@@ -518,7 +686,7 @@ class NavalBattleWorld:
             ),
             (
                 _pad_row(
-                    f"   Ora locale               : {snap.city_local_time.strftime('%H:%M:%S') if snap.city_local_time is not None else 'N/D'} | Tema {snap.appearance_mode.value.upper()}"
+                    f"   Ora locale / HUD         : {(snap.city_local_time or datetime.now()).strftime('%H:%M:%S')} | HUD {hud_label}"
                 ),
                 COLOR_MENU_TEXT,
                 False,
@@ -548,12 +716,22 @@ class NavalBattleWorld:
                 False,
             ),
             (
-                _pad_row("   [F2]/[F3]: Refresh -/+ 5 FPS (limiti 5-120)"),
+                _pad_row("   [G] / [N] : Forza modalita' Giorno / Notte"),
                 COLOR_MENU_KEY,
                 False,
             ),
             (
                 _pad_row("   [T]       : Tema Auto / Light / Dark"),
+                COLOR_MENU_KEY,
+                False,
+            ),
+            (
+                _pad_row("   [H]       : Toggle HUD (Auto / Big Clock / Compatto)"),
+                COLOR_MENU_KEY,
+                False,
+            ),
+            (
+                _pad_row("   [F2]/[F3]: Refresh -/+ 5 FPS (limiti 5-120)"),
                 COLOR_MENU_KEY,
                 False,
             ),
@@ -588,13 +766,59 @@ class NavalBattleWorld:
                 transparent=False,
             )
 
+    def handle_key(self, key: int) -> bool:
+        """
+        Processa un singolo codice tasto.
+        Restituisce False se l'utente ha richiesto l'uscita dal programma ([Q] o [Esc]),
+        altrimenti True.
+        """
+        if self.handle_refresh_key(key):
+            return True
+        if key in (ord("m"), ord("M")):
+            self.toggle_menu()
+            return True
+        if key == Screen.KEY_ESCAPE:
+            if self.menu_open:
+                self.menu_open = False
+                return True
+            return False
+        if key in (ord("q"), ord("Q")):
+            return False
+        if key == 32 or key == ord(" "):
+            if not self.menu_open:
+                self.force_salvo()
+            return True
+        if key in (ord("w"), ord("W")):
+            self.weather_state.cycle_weather()
+            return True
+        if key in (ord("+"), ord("=")):
+            self.adjust_max_ships(1)
+            return True
+        if key in (ord("-"), ord("_")):
+            self.adjust_max_ships(-1)
+            return True
+        if key in (ord("g"), ord("G")):
+            self.weather_state.force_day()
+            return True
+        if key in (ord("n"), ord("N")):
+            self.weather_state.force_night()
+            return True
+        if key in (ord("t"), ord("T")):
+            self.weather_state.cycle_appearance_mode()
+            return True
+        if key in (ord("h"), ord("H")):
+            self.cycle_hud_mode()
+            return True
+        return True
+
     def draw(self, renderer: Renderer) -> None:
         """
         Disegna l'intera scena nell'ordine rigoroso di Z-index a ogni frame:
         1. Cielo, stelle, luna/sole, nuvole e GABBIANI (sfondo).
         2. Mare di fondo, PESCI e tutte le onde dietro le navi.
         3. NAVI e proiettili/fumo in primo piano.
-        5. Header superiore minimale e, se attivo, Menù modale in sovraimpressione.
+        4. Header superiore (Top Bar compatta + Big HUD su schermi grandi).
+        5. Menù modale in sovraimpressione se attivo.
         """
         snap = self.weather_state.snapshot()
         renderer.flash_intensity = self.weather_fx.flash_intensity
@@ -642,21 +866,29 @@ class NavalBattleWorld:
                     transparent=True,
                 )
 
-        # 4. Pannello meteo in alto, senza titolo.
-        for row, line in enumerate(_weather_hud_lines(snap)):
-            renderer.draw_text(
-                line[: self.width].ljust(self.width),
-                0,
-                row,
-                COLOR_MENU_TEXT,
-                bg_rgb=COLOR_MENU_BG,
-                bold=True,
-                transparent=False,
-            )
+        # 4. HUD superiore (Top Bar compatta o Big HUD responsive)
+        self._draw_hud(renderer, snap)
 
         # 5. Menù modale in sovraimpressione se aperto ([M])
         if self.menu_open:
             self._draw_menu_overlay(renderer, snap)
+
+
+def _drain_keyboard_events(screen: Screen) -> List[int]:
+    """Drena tutti gli eventi di input in coda nel frame corrente in modo non bloccante."""
+    keys: List[int] = []
+    while True:
+        ev = screen.get_event() if hasattr(screen, "get_event") else None
+        if ev is None:
+            key = screen.get_key() if hasattr(screen, "get_key") else None
+            if key is None:
+                break
+            keys.append(int(key))
+        elif isinstance(ev, KeyboardEvent):
+            keys.append(int(ev.key_code))
+        elif isinstance(ev, int):
+            keys.append(ev)
+    return keys
 
 
 def run_asciimatics_loop(
@@ -668,7 +900,7 @@ def run_asciimatics_loop(
     Avvia e gestisce il game loop principale su asciimatics.screen.Screen,
     intercettando il ridimensionamento della finestra (SIGWINCH) senza perdere lo stato.
     """
-    world: NavalBattleWorld | None = None
+    world: Optional[NavalBattleWorld] = None
 
     def _screen_main(screen: Screen) -> None:
         nonlocal world
@@ -690,47 +922,25 @@ def run_asciimatics_loop(
             if screen.has_resized():
                 return
 
-            now = time.monotonic()
-            raw_dt = max(0.001, now - last_time)
-            dt = min(max(0.1, 1.0 / world.target_fps), raw_dt)
-            last_time = now
+            start_time = time.monotonic()
+            raw_dt = max(0.001, start_time - last_time)
+            frame_budget = 1.0 / max(1, world.target_fps)
+            dt = min(max(0.1, frame_budget), raw_dt)
+            last_time = start_time
             world.current_fps = 0.85 * world.current_fps + 0.15 * min(240.0, 1.0 / raw_dt)
 
-            while True:
-                ev = screen.get_key()
-                if ev is None:
-                    break
-                if world.handle_refresh_key(ev):
-                    pass
-                elif ev in (ord("m"), ord("M")):
-                    world.toggle_menu()
-                elif ev == Screen.KEY_ESCAPE:
-                    if world.menu_open:
-                        world.menu_open = False
-                    else:
-                        raise StopIteration
-                elif ev in (ord("q"), ord("Q")):
+            for key in _drain_keyboard_events(screen):
+                if not world.handle_key(key):
                     raise StopIteration
-                elif ev == ord(" "):
-                    if not world.menu_open:
-                        world.force_salvo()
-                elif ev in (ord("w"), ord("W")):
-                    weather_state.cycle_weather()
-                elif ev in (ord("+"), ord("=")):
-                    world.adjust_max_ships(1)
-                elif ev in (ord("-"), ord("_")):
-                    world.adjust_max_ships(-1)
-                elif ev in (ord("g"), ord("G"), ord("n"), ord("N"), ord("t"), ord("T")):
-                    weather_state.cycle_appearance_mode()
 
             world.update(dt)
             world.draw(renderer)
             screen.refresh()
 
-            elapsed = time.monotonic() - now
-            sleep_for = 1.0 / world.target_fps - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+            elapsed = time.monotonic() - start_time
+            sleep_time = (1.0 / max(1, world.target_fps)) - elapsed
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
 
     while True:
         try:

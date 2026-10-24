@@ -5,15 +5,16 @@ senza bloccare il main thread.
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
+import socket
 import threading
 import time
+from typing import Any, Dict, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
-from typing import Optional, Tuple
 
 from config import (
     AppearanceMode,
@@ -34,7 +35,7 @@ def _default_time_of_day_from_clock() -> TimeOfDay:
     return TimeOfDay.DAY if 7 <= hour < 19 else TimeOfDay.NIGHT
 
 
-@dataclass
+@dataclass(frozen=True)
 class WeatherSnapshot:
     """Rappresentazione immutabile dello stato meteo per il main thread."""
     city: str
@@ -149,6 +150,26 @@ class WeatherState:
                 self._forced_time = self._time_of_day
             return self._appearance_mode
 
+    def set_forced_time(self, time_of_day: TimeOfDay) -> TimeOfDay:
+        """Forza esplicitamente la modalità diurna (DAY) o notturna (NIGHT)."""
+        with self._lock:
+            self._time_of_day = time_of_day
+            self._forced_time = time_of_day
+            self._appearance_mode = (
+                AppearanceMode.LIGHT
+                if time_of_day == TimeOfDay.DAY
+                else AppearanceMode.DARK
+            )
+            return self._time_of_day
+
+    def force_day(self) -> TimeOfDay:
+        """Forza la modalità GIORNO ([G])."""
+        return self.set_forced_time(TimeOfDay.DAY)
+
+    def force_night(self) -> TimeOfDay:
+        """Forza la modalità NOTTE ([N])."""
+        return self.set_forced_time(TimeOfDay.NIGHT)
+
     def toggle_time_of_day(self) -> TimeOfDay:
         """Compatibilita' per i chiamanti storici del toggle giorno/notte."""
         with self._lock:
@@ -253,12 +274,17 @@ class WeatherState:
                 self._city_time_monotonic = time.monotonic()
 
     def set_error(self, note: str) -> None:
-        """Registra un errore di rete mantenendo l'ultimo meteo valido."""
+        """Registra un errore di rete mantenendo silenziosamente l'ultimo meteo valido."""
         with self._lock:
-            self._status_note = note
+            if self._forced_condition is not None:
+                self._status_note = (
+                    f"FORCED ({self._forced_condition.value.upper()}) [Offline]"
+                )
+            else:
+                self._status_note = note
 
     def snapshot(self) -> WeatherSnapshot:
-        """Restituisce una copia atomica dello stato corrente."""
+        """Restituisce una copia atomica immutabile dello stato corrente."""
         with self._lock:
             return WeatherSnapshot(
                 city=self._city,
@@ -304,25 +330,27 @@ class WeatherPollerThread(threading.Thread):
         poll_interval: int = WEATHER_POLL_INTERVAL_SEC,
     ) -> None:
         super().__init__(name="OpenMeteoPoller", daemon=True)
-        self.state = state
-        self.city_query = city
-        self.poll_interval = poll_interval
-        self._stop_event = threading.Event()
+        self.state: WeatherState = state
+        self.city_query: str = city
+        self.poll_interval: int = poll_interval
+        self._stop_event: threading.Event = threading.Event()
         self._coords_cache: Optional[Tuple[float, float, str]] = None
 
     def stop(self) -> None:
-        """Richiede l'arresto pulito del thread."""
+        """Richiede l'arresto pulito del thread demone."""
         self._stop_event.set()
 
-    def _http_get_json(self, url: str) -> dict:
-        """Esegue una richiesta GET HTTP e restituisce il JSON decodificato."""
+    def _http_get_json(self, url: str) -> Dict[str, Any]:
+        """Esegue una richiesta GET HTTP con timeout rigoroso (3-5s) e decodifica il JSON."""
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "AsciiShips/1.0 (Python urllib; TUI Naval Screensaver)"},
         )
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
+        timeout = max(1, min(5, HTTP_TIMEOUT_SEC))
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
-            return json.loads(raw)
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
 
     def _geocode_city(self, city_name: str) -> Tuple[float, float, str]:
         """Converte il nome della città in (latitudine, longitudine, nome_risolto)."""
@@ -335,7 +363,7 @@ class WeatherPollerThread(threading.Thread):
         url = f"{GEOCODING_API_URL}?{params}"
         data = self._http_get_json(url)
         results = data.get("results")
-        if not results:
+        if not results or not isinstance(results, list):
             raise ValueError(f"Città non trovata: '{city_name}'")
 
         first = results[0]
@@ -399,7 +427,7 @@ class WeatherPollerThread(threading.Thread):
         return wmo_code, temp, apparent, humidity, wind, is_day, city_time
 
     def fetch_once(self) -> None:
-        """Esegue un singolo ciclo di geocodifica + recupero meteo."""
+        """Esegue un singolo ciclo di geocodifica + recupero meteo con gestione resiliente degli errori."""
         try:
             lat, lon, resolved_city = self._geocode_city(self.city_query)
             (
@@ -411,8 +439,6 @@ class WeatherPollerThread(threading.Thread):
                 is_day,
                 city_local_time,
             ) = self._fetch_current_weather(lat, lon)
-            snap = self.state.snapshot()
-            note = f"FORCED ({snap.condition.value.upper()})" if snap.is_forced else "LIVE"
             self.state.update(
                 city=resolved_city,
                 wmo_code=wmo_code,
@@ -424,14 +450,18 @@ class WeatherPollerThread(threading.Thread):
                 is_day=is_day,
                 latitude=lat,
                 longitude=lon,
-                status_note=note,
+                status_note="LIVE",
             )
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            snap = self.state.snapshot()
-            if snap.is_forced:
-                self.state.set_error(f"FORCED ({snap.condition.value.upper()}) [Offline]")
-            else:
-                self.state.set_error(f"Offline ({type(exc).__name__})")
+        except (
+            urllib.error.URLError,
+            socket.timeout,
+            TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+            KeyError,
+            OSError,
+        ) as exc:
+            self.state.set_error(f"Offline ({type(exc).__name__})")
 
     def run(self) -> None:
         """Ciclo principale del thread demone."""
@@ -439,3 +469,7 @@ class WeatherPollerThread(threading.Thread):
             self.fetch_once()
             if self._stop_event.wait(timeout=self.poll_interval):
                 break
+
+
+# Alias per compatibilità semantica con il worker meteo in background
+WeatherWorker = WeatherPollerThread

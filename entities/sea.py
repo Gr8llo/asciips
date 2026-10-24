@@ -417,7 +417,6 @@ class Sea:
         )
 
         foam_col = COLOR_WAVE_FOAM_DAY if is_day else COLOR_WAVE_FOAM
-        surf_col = COLOR_WAVE_SURFACE_DAY if is_day else COLOR_WAVE_SURFACE
 
         sea_depth = max(0, self.height - base_y - 2)
         track_spacing = max(3, sea_depth // 5)

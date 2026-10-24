@@ -12,7 +12,6 @@ from typing import List, Tuple
 from config import (
     CANNON_DAMAGE_MAX,
     CANNON_DAMAGE_MIN,
-    COLOR_EXPLOSION,
     COLOR_EXPLOSION_ORANGE,
     COLOR_EXPLOSION_YELLOW,
     COLOR_MUZZLE_SMOKE,
@@ -22,7 +21,6 @@ from config import (
     COLOR_PROJECTILE_TEXT,
     COLOR_PROJECTILE_TRAIL,
     COLOR_SMOKE,
-    COLOR_WAVE_CREST,
     GRAVITY,
     RGB,
 )
@@ -46,7 +44,13 @@ class CombatParticle:
     bold: bool = True
 
     @property
+    def ttl(self) -> int:
+        """Restituisce i frame di vita residui della particella."""
+        return self.frames_left
+
+    @property
     def active(self) -> bool:
+        """Restituisce True finché la particella ha vita residua (ttl > 0)."""
         return self.frames_left > 0
 
     def update(self, dt: float) -> None:
@@ -165,6 +169,7 @@ class Projectile:
     vx: float
     vy: float  # Velocità iniziale verticale verso l'alto (celle/s)
     text: str
+    water_depth: float = 0.0
     damage: int = field(
         default_factory=lambda: random.randint(CANNON_DAMAGE_MIN, CANNON_DAMAGE_MAX)
     )
@@ -182,17 +187,25 @@ class Projectile:
         target_x: float,
         target_y: float,
         text: str,
+        water_depth: float = 0.0,
         gravity: float = GRAVITY,
     ) -> "Projectile":
         """
         Calcola la velocità iniziale (vx, vy) per colpire le vicinanze di (target_x, target_y)
-        con un arco parabolico realistico e una lieve imprecisione balistica.
+        con un arco parabolico realistico sempre ascendente alla partenza.
         """
-        dx = (target_x + random.uniform(-3.0, 3.0)) - start_x
+        dx = (target_x + random.uniform(-1.5, 1.5)) - start_x
+        if abs(dx) < 4.0:
+            dx = 4.0 if dx >= 0.0 else -4.0
         dy = start_y - target_y  # Positivo se il bersaglio è più in alto
 
         dist = abs(dx)
-        flight_time = max(1.0, min(2.8, dist / random.uniform(16.0, 23.0)))
+        min_arc_time = math.sqrt(2.0 * (abs(dy) + 3.5) / max(1.0, gravity))
+        flight_time = max(
+            1.0,
+            min_arc_time,
+            min(2.8, dist / random.uniform(16.0, 22.0)),
+        )
 
         vx = dx / flight_time
         # Da h(T) - h0 = vy * T - 0.5 * g * T^2  =>  vy = (dy + 0.5 * g * T^2) / T
@@ -205,7 +218,13 @@ class Projectile:
             vx=vx,
             vy=vy,
             text=text,
+            water_depth=max(0.0, water_depth),
         )
+
+    @property
+    def is_descending(self) -> bool:
+        """Restituisce True quando il proiettile ha superato il vertice della parabola."""
+        return (self.vy - GRAVITY * self.elapsed) <= 0.0
 
     @property
     def x(self) -> float:
