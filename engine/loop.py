@@ -5,25 +5,25 @@ e Menù modale in sovraimpressione ([M] / [Esc]).
 """
 
 from __future__ import annotations
-from datetime import datetime
+
 import json
 import math
-from pathlib import Path
 import random
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 from asciimatics.event import KeyboardEvent
 from asciimatics.screen import Screen
 
 from config import (
-    AppearanceMode,
     BIG_HUD_MIN_HEIGHT,
     BIG_HUD_MIN_WIDTH,
     COLOR_WAVE_CREST,
     DEFAULT_FPS,
     FALLBACK_PHRASES,
     FPS_STEP,
-    HudMode,
     MAX_FPS,
     MIN_FPS,
     PHRASES_FILE,
@@ -36,6 +36,8 @@ from config import (
     SHIP_RESPAWN_DELAY_MAX,
     SHIP_RESPAWN_DELAY_MIN,
     SNOW_CONDITIONS,
+    AppearanceMode,
+    HudMode,
 )
 from engine.big_font import BIG_FONT_5X, BIG_HUD_GOLD, render_big_text
 from engine.renderer import Renderer
@@ -50,7 +52,6 @@ from entities.projectile import (
 from entities.sea import Sea
 from entities.ship import SHIP_CLASSES, Ship, ShipState
 from entities.weather import WeatherSystem
-
 
 COLOR_MENU_BG: RGB = (12, 22, 42)
 COLOR_MENU_BORDER: RGB = (220, 185, 95)
@@ -155,7 +156,7 @@ def _compact_top_bar_line(snap: WeatherSnapshot) -> str:
     )
     mode = "DAY" if snap.is_day else "NIGHT"
     return (
-        f" {snap.city} | {local_clock} | {snap.condition.value.upper()} "
+        f" {snap.city} | {snap.condition.value.upper()} "
         f"| {temperature} | Umid {humidity} | Vento {snap.wind_speed_kmh:.0f}km/h "
         f"| {mode} | [Spazio] Fuoco [W] Meteo [H] HUD [M] Menu"
     )
