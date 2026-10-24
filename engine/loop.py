@@ -139,16 +139,6 @@ def _weather_hud_lines(snap: WeatherSnapshot) -> Tuple[str, ...]:
 
 def _compact_top_bar_line(snap: WeatherSnapshot) -> str:
     """Formatta la Top Bar compatta a riga singola per finestre con height < 30."""
-    local_clock = (
-        snap.city_local_time.strftime("%H:%M:%S")
-        if snap.city_local_time is not None
-        else datetime.now().strftime("%H:%M:%S")
-    )
-    temperature = (
-        f"{snap.temperature_c:.1f}°C"
-        if snap.temperature_c is not None
-        else "N/D"
-    )
     humidity = (
         f"{snap.relative_humidity_pct:.0f}%"
         if snap.relative_humidity_pct is not None
@@ -157,7 +147,7 @@ def _compact_top_bar_line(snap: WeatherSnapshot) -> str:
     mode = "DAY" if snap.is_day else "NIGHT"
     return (
         f" {snap.city} | {snap.condition.value.upper()} "
-        f"| {temperature} | Umid {humidity} | Vento {snap.wind_speed_kmh:.0f}km/h "
+        f"| Umid {humidity} | Vento {snap.wind_speed_kmh:.0f}km/h "
         f"| {mode} | [Spazio] Fuoco [W] Meteo [H] HUD [M] Menu"
     )
 
